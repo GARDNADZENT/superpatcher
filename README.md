@@ -23,33 +23,28 @@ images don't need to fit in RAM or ever touch a server.
 - Supports `LINEAR` extents (the normal case) and `ZERO` (dm-zero) extents.
 - Multiple metadata slots (A/B devices) are selectable from a dropdown.
 - **Saving**, in order of preference:
-  1. `showDirectoryPicker()` — pick one output folder, every partition is
-     streamed into it as `<name>.img`. Best option, works for any size, but
-     only available on Chromium with a real top-level tab (not embedded in
-     an iframe, and not on Firefox/Safari/most mobile browsers).
-  2. **Automatic streaming download** (`src/stream-download.js` +
-     `public/stream-download-sw.js`) — the default whenever no folder was
-     explicitly chosen and the directory/file pickers above aren't
-     available or usable. A tiny service worker turns the bytes being
-     written into a real, normal browser download (streamed straight to
-     your regular Downloads folder, via a hidden same-origin iframe
-     navigating to a worker-intercepted URL with
-     `Content-Disposition: attachment` — the same technique the
-     battle-tested [StreamSaver.js](https://github.com/jimmywarting/StreamSaver.js)
-     library uses). No folder picker, no dialog, and — thanks to
-     pull-based backpressure between the page and the worker — memory use
-     stays bounded to about one chunk in flight (tens of MB) no matter how
-     large the file is; verified against a real headless-Chrome download of
-     a 640 MiB stream with a flat ~20 MB JS heap throughout and a
-     byte-for-byte SHA-256 match. This is what makes large files safe to
-     build even in browsers/contexts where the folder-picker APIs don't
-     work at all.
-  3. `showSaveFilePicker()` — per-file "Save As" dialog, still streamed.
-  4. Classic `<a download>` + `Blob` — last-resort fallback for the rare
-     browser with neither service workers nor any File System Access API;
-     buffers the whole file in memory first (a clear in-UI warning is shown
-     if this path is ever used for a large file).
-- Live per-partition progress bars, a running log, and cancellation.
+  1. `showDirectoryPicker()` — pick one output folder up front (section 3's
+     "Choose a specific output folder…" button), and every subsequent
+     partition/build streams straight into it as `<name>.img`, with zero
+     in-memory buffering regardless of size. Only available on Chromium
+     with a real top-level tab (not embedded in an iframe, and not on
+     Firefox/Safari/most mobile browsers) — look for the "Open in a new
+     tab" link shown when this isn't available.
+  2. **Explicit download link (the default whenever no folder was
+     chosen).** The file is built fully in memory, then a real, clickable
+     "⬇ Download `<name>`" link appears (plus a "Save As…" button when the
+     File System Access save-file picker is available, for explicitly
+     choosing a destination folder/filename). Nothing is auto-triggered —
+     you decide when and how to save, and can simply click the link again
+     if a save attempt is ever interrupted. This is the standard,
+     universally-supported `<a download>` + `Blob` browser download
+     mechanism, so it honors your browser's own "ask where to save each
+     file" setting if you have that turned on.
+- Live per-partition progress bars (with periodic 25%-step log lines, not
+  just a silent bar), a running log that narrates every step of a build —
+  hashing, per-target verification, per-chunk build progress, each
+  validation check, and report writing all get their own log line — and
+  cancellation.
 - **Security scan: find Device Administrator-capable & security-plugin-like
   APKs.** Reads directly from a selected partition's filesystem (ext4 or
   EROFS, auto-detected from the superblock — no extraction-to-disk required
@@ -122,10 +117,16 @@ src/
 │                    super.img" step streams the whole disk back out with
 │                    all patches applied
 ├── saver.js          File System Access API sinks + Blob-download fallback
-├── stream-download.js  Automatic streaming-download sink (no folder picker
-│                    needed) built on public/stream-download-sw.js, a small
-│                    service worker that turns page-side bytes into a real,
-│                    memory-bounded browser download
+├── stream-download.js  An automatic, no-folder-picker streaming-download
+│                    sink (built on public/stream-download-sw.js, a small
+│                    service worker) -- implemented, unit-tested, and kept
+│                    in the repo, but NOT currently wired into the default
+│                    save flow: it produced "Disk full" download-manager
+│                    failures in some real browser/OS combinations in
+│                    practice, which is worse than the current explicit
+│                    download-link flow in main.js. Available for future
+│                    use/revisiting if that turns out to be worth chasing
+│                    down further.
 ├── crc32c.js          Castagnoli CRC32 (used for ext4 metadata_csum and the
 │                    EROFS superblock checksum, both recomputed after edits)
 ├── ext4.js             ext4 driver: superblock, 32/64-bit group descriptors,
@@ -420,11 +421,11 @@ the same layout the scanner can't read) lives at
   is Chromium-only today, and even there it's unavailable inside an
   embedded/iframed page (no folder picker is allowed in that context by the
   browser itself, not a bug in this app — look for the "Open in a new tab"
-  link shown when this is detected). Other browsers/contexts automatically
-  use the streaming-download fallback described above instead, which still
-  avoids large in-memory buffering; only the oldest/most unusual browsers
-  (no service worker support at all) fall back further to per-file save
-  dialogs or fully in-memory downloads.
+  link shown when this is detected). Everywhere else, every build/extract
+  action instead finishes with an explicit, clickable download link (see
+  "Saving" above) — which does mean the whole file is held in memory until
+  you click it, so for a very large image on a memory-constrained device,
+  picking a folder up front (where available) is still the better option.
 - Filesystems other than ext4/EROFS (e.g. F2FS, which some older or
   vendor-specific devices use for `super` sub-partitions) aren't recognized
   by the scanner and are skipped with a warning.

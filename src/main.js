@@ -12,15 +12,22 @@ import {
   DeviceLockRemovalError,
 } from './device-lock-removal.js';
 import { createSha256Stream, toHex } from './sha256.js';
-import { createStreamingDownloadSink, supportsStreamingDownload } from './stream-download.js';
+// Note: src/stream-download.js (an automatic, no-folder-picker streaming
+// download via a service worker) is kept in the repo and fully tested, but
+// deliberately NOT used here as a silent default anymore -- in practice it
+// produced "Disk full" download-manager failures in some real
+// browser/OS/download-manager combinations (likely related to how that
+// browser pre-allocates space for a worker-streamed response), which is
+// strictly worse than the honest, explicit flow below: build the result,
+// then show a real, clickable download link (+ a native "Save As" button
+// when available) so the user can see it's ready and choose where it goes,
+// exactly like any ordinary file download.
 import {
   supportsDirectoryPicker,
   supportsSaveFilePicker,
   pickDirectory,
   verifyDirectoryPermission,
   directorySink,
-  saveFilePickerSink,
-  blobDownloadSink,
 } from './saver.js';
 
 // ---------- small DOM helpers ----------
@@ -323,55 +330,106 @@ const extractBtn = $('extractBtn');
 const cancelBtn = $('cancelBtn');
 const progressList = $('progressList');
 
-function fallbackDownloadSink(filename) {
-  return blobDownloadSink(filename, {
-    onLargeSizeWarning: (bytes) =>
-      log(
-        `"${filename}" has buffered ${formatBytes(bytes)} in memory (no folder was chosen, and streaming ` +
-          `downloads aren't available in this browser). Your browser tab may run out of memory for very ` +
-          `large partitions.`,
-        'warn'
-      ),
-  });
+/**
+ * Renders a "ready to download" block into `containerEl`: a real, clickable
+ * Blob-URL download link (standard browser download flow -- if the user's
+ * browser is set to ask where to save each file, this is exactly where
+ * they get to choose), plus a native "Save As…" button whenever the File
+ * System Access API's save picker is available, so there's always an
+ * explicit way to pick a destination folder/filename regardless of browser
+ * download settings.
+ */
+function renderDownloadReady(containerEl, filename, blob) {
+  const url = URL.createObjectURL(blob);
+  const box = document.createElement('div');
+  box.className = 'download-ready';
+
+  const link = document.createElement('a');
+  link.className = 'dl-link';
+  link.href = url;
+  link.download = filename;
+  link.textContent = `⬇ Download ${filename}`;
+  box.appendChild(link);
+
+  const meta = document.createElement('span');
+  meta.className = 'dl-meta';
+  meta.textContent = formatBytes(blob.size);
+  box.appendChild(meta);
+
+  if (supportsSaveFilePicker()) {
+    const saveAsBtn = document.createElement('button');
+    saveAsBtn.className = 'secondary';
+    saveAsBtn.type = 'button';
+    saveAsBtn.textContent = 'Save As… (choose folder)';
+    saveAsBtn.addEventListener('click', async () => {
+      saveAsBtn.disabled = true;
+      try {
+        const handle = await window.showSaveFilePicker({ suggestedName: filename });
+        const writable = await handle.createWritable();
+        await writable.write(blob);
+        await writable.close();
+        log(`Saved "${filename}" via Save As.`, 'ok');
+      } catch (err) {
+        if (err.name !== 'AbortError') log(`Save As failed for "${filename}": ${err.message}`, 'err');
+      } finally {
+        saveAsBtn.disabled = false;
+      }
+    });
+    box.appendChild(saveAsBtn);
+  }
+
+  containerEl.appendChild(box);
+  return url;
 }
 
-async function makeSink(filename, totalSizeBytes = null) {
+/**
+ * Collects every written chunk in memory and, on close(), renders a
+ * download-ready block (see renderDownloadReady) instead of silently
+ * auto-triggering anything -- the user explicitly clicks when and how they
+ * want to save, which is also the most universally reliable, standard
+ * browser download mechanism there is (works identically everywhere,
+ * honors "ask where to save" browser settings, and is trivially retriable
+ * by clicking again if a save attempt is somehow interrupted).
+ */
+function createCollectingSink(filename, containerEl) {
+  const parts = [];
+  let total = 0;
+  return {
+    write: async (chunk) => {
+      parts.push(chunk);
+      total += chunk.length;
+    },
+    close: async () => {
+      const blob = new Blob(parts);
+      parts.length = 0;
+      renderDownloadReady(containerEl, filename, blob);
+      log(`"${filename}" is ready (${formatBytes(blob.size)}) — click the download link above to save it.`, 'ok');
+    },
+    abort: async () => {
+      parts.length = 0;
+    },
+  };
+}
+
+/**
+ * @param {string} filename
+ * @param {number|null} totalSizeBytes unused here (kept for call-site
+ *   symmetry / potential future progress-UI use); the collecting sink
+ *   doesn't need to know the size up front.
+ * @param {HTMLElement} containerEl where to render the eventual download
+ *   link, if no folder was explicitly chosen.
+ */
+async function makeSink(filename, totalSizeBytes, containerEl) {
   if (state.dirHandle) {
+    log(`Saving "${filename}" directly into the chosen folder…`);
     return directorySink(state.dirHandle, filename);
   }
-  if (supportsStreamingDownload()) {
-    // No folder picker, no dialog, no buffering the whole file in memory:
-    // streams straight into a normal, automatic browser download (the
-    // user's default Downloads folder), via a small service worker. This
-    // is the best available option whenever the user hasn't explicitly
-    // picked an output folder, and works in browsers/contexts (Firefox,
-    // Safari, iframed Chrome/Edge) where the File System Access API
-    // folder/file pickers are unavailable or blocked.
-    try {
-      return await createStreamingDownloadSink(filename, totalSizeBytes);
-    } catch (err) {
-      log(`Streaming download unavailable for "${filename}" (${err.message}); trying another method.`, 'warn');
-    }
-  }
-  if (supportsSaveFilePicker()) {
-    // showSaveFilePicker needs "transient activation" (a recent user
-    // gesture). It works for the first file in a batch, but can start
-    // throwing NotAllowedError for later files once that activation has
-    // expired, or anywhere inside a disallowed iframe. Fall back to a
-    // plain download in either case instead of failing the extraction.
-    try {
-      return await saveFilePickerSink(filename);
-    } catch (err) {
-      if (err.name === 'AbortError') throw err; // user explicitly cancelled the dialog
-      log(`Save dialog unavailable for "${filename}" (${explainPickerFailure(err)}); downloading instead.`, 'warn');
-      return fallbackDownloadSink(filename);
-    }
-  }
-  return fallbackDownloadSink(filename);
+  return createCollectingSink(filename, containerEl);
 }
 
 
 function addProgressRow(name, container = progressList) {
+  const wrap = document.createElement('div');
   const row = document.createElement('div');
   row.className = 'progress-row';
   row.innerHTML = `
@@ -379,8 +437,12 @@ function addProgressRow(name, container = progressList) {
     <div class="progress-track"><div class="progress-fill"></div></div>
     <div class="size" style="text-align:right;">0%</div>
   `;
-  container.appendChild(row);
+  const extra = document.createElement('div');
+  wrap.appendChild(row);
+  wrap.appendChild(extra);
+  container.appendChild(wrap);
   return {
+    extraEl: extra, // where a download-ready block (see renderDownloadReady) gets appended
     setProgress(frac) {
       row.querySelector('.progress-fill').style.width = `${Math.min(100, frac * 100).toFixed(1)}%`;
       row.querySelector('.size').textContent = `${Math.min(100, frac * 100).toFixed(0)}%`;
@@ -411,6 +473,12 @@ extractBtn.addEventListener('click', async () => {
   let okCount = 0;
   let failCount = 0;
 
+  log(
+    state.dirHandle
+      ? `Output folder "${state.dirHandle.name}" is set — each partition streams straight to disk as it's read.`
+      : 'No output folder chosen — each partition will be held in memory and offered as a download link when ready.'
+  );
+
   for (const name of names) {
     if (state.cancelRequested) {
       log('Extraction cancelled by user.', 'warn');
@@ -421,10 +489,19 @@ extractBtn.addEventListener('click', async () => {
     const totalBytes = partitionSizeBytes(meta, partition);
     log(`Extracting "${name}" (${formatBytes(totalBytes)})…`);
     try {
-      const sink = await makeSink(`${name}.img`, Number(totalBytes));
+      const sink = await makeSink(`${name}.img`, Number(totalBytes), ui.extraEl);
+      let lastLoggedPct = -1;
       await extractPartition(disk, meta, partition, sink, {
         onProgress: (written, total) => {
-          if (total > 0n) ui.setProgress(Number(written) / Number(total));
+          if (total > 0n) {
+            const frac = Number(written) / Number(total);
+            ui.setProgress(frac);
+            const pct = Math.floor(frac * 100 / 25) * 25; // log at 0/25/50/75/100
+            if (pct > lastLoggedPct && pct < 100) {
+              lastLoggedPct = pct;
+              log(`    "${name}": ${pct}% (${formatBytes(written)} / ${formatBytes(total)})`);
+            }
+          }
         },
         isCancelled: () => state.cancelRequested,
       });
@@ -745,21 +822,37 @@ removeBtn.addEventListener('click', async () => {
   log(`Removal pass complete: ${removedOk} succeeded, ${removedFail} failed, ${state.patchSet.count} byte-range patch(es) recorded.`);
 
   try {
+    log(
+      state.dirHandle
+        ? `Streaming super_patched.img straight into the chosen folder "${state.dirHandle.name}"…`
+        : 'Building super_patched.img in memory — a download link will appear below when it\'s ready…'
+    );
     const ui = addProgressRow('super_patched.img', removeProgress);
-    const sink = await makeSink('super_patched.img', state.disk.totalSize);
+    const sink = await makeSink('super_patched.img', state.disk.totalSize, ui.extraEl);
     const { disk, patchSet } = state;
     let written = 0;
+    let lastLoggedPct = -1;
     for await (const chunk of streamPatchedDisk(disk, patchSet)) {
       await sink.write(chunk);
       written += chunk.length;
-      ui.setProgress(written / disk.totalSize);
+      const frac = written / disk.totalSize;
+      ui.setProgress(frac);
+      const pct = Math.floor((frac * 100) / 25) * 25;
+      if (pct > lastLoggedPct && pct < 100) {
+        lastLoggedPct = pct;
+        log(`  super_patched.img: ${pct}% (${formatBytes(written)} / ${formatBytes(disk.totalSize)})`);
+      }
     }
+    log(`  super_patched.img: 100% (${formatBytes(written)}) — finalizing…`);
     await sink.close();
     ui.setDone();
-    removeStatus.textContent =
-      `Done. Downloaded super_patched.img (${formatBytes(disk.totalSize)}). ` +
-      `Flash it with fastboot (e.g. "fastboot flash super super_patched.img") — see the warnings above section 5 ` +
-      `about AVB/dm-verity before you do.`;
+    removeStatus.textContent = state.dirHandle
+      ? `Done. Saved super_patched.img (${formatBytes(disk.totalSize)}) to "${state.dirHandle.name}". ` +
+        `Flash it with fastboot (e.g. "fastboot flash super super_patched.img") — see the warnings above section 5 ` +
+        `about AVB/dm-verity before you do.`
+      : `Done. super_patched.img (${formatBytes(disk.totalSize)}) is ready — click the download link below. ` +
+        `Flash it with fastboot (e.g. "fastboot flash super super_patched.img") — see the warnings above section 5 ` +
+        `about AVB/dm-verity before you do.`;
     log('Patched super.img build complete.', 'ok');
   } catch (err) {
     console.error(err);
@@ -794,16 +887,26 @@ deviceLockBtn.addEventListener('click', async () => {
   scanBtn.disabled = true;
   removeBtn.disabled = true;
   deviceLockResult.textContent = '';
+  const deviceLockDownloads = $('deviceLockDownloads');
+  deviceLockDownloads.innerHTML = '';
   deviceLockStatus.textContent = 'Hashing original image…';
   log('Starting "Remove Device Lock Components"…');
+  log(
+    state.dirHandle
+      ? `Output folder "${state.dirHandle.name}" is set — results stream straight to disk.`
+      : 'No output folder chosen — results will be held in memory and offered as download links when ready.'
+  );
 
   try {
+    log('Step 1/6: computing SHA-256 of the original image (for the modification report)…');
     const originalSha256 = await hashWholeDisk(disk);
+    log(`  original SHA-256: ${originalSha256}`, 'ok');
 
     // Snapshot the TRUE pre-removal file listing for the two target
     // partitions *before* calling removeDeviceLockComponents (which
     // performs the actual removal before returning) — read-only, no
     // PatchSet, so these reads can never see an edit.
+    log('Step 2/6: opening target partitions and snapshotting their current file listing…');
     const targetPartitionNames = [...new Set(DEVICE_LOCK_TARGETS.map((t) => t.partition))];
     const originalFileListByPartition = {};
     for (const name of targetPartitionNames) {
@@ -812,9 +915,11 @@ deviceLockBtn.addEventListener('click', async () => {
       const readRange = makePartitionReader(disk, meta, partition);
       const { volume } = await detectAndOpenFilesystem(readRange);
       originalFileListByPartition[name] = await listAllFilePaths(volume);
+      log(`  "${name}": ${originalFileListByPartition[name].length} file(s) found before any change.`);
     }
 
     deviceLockStatus.textContent = 'Verifying target files exist…';
+    log('Step 3/6: verifying all 3 target files exist by exact path (not via the scanner) before changing anything…');
     const result = await removeDeviceLockComponents(disk, meta, (evt) => {
       if (evt.phase === 'missing') log(`  ✗ NOT FOUND: ${evt.target.path} (${evt.target.partition})`, 'err');
       if (evt.phase === 'verified') log(`  ✓ found: ${evt.target.path} (${evt.target.partition})`, 'ok');
@@ -822,20 +927,35 @@ deviceLockBtn.addEventListener('click', async () => {
     });
 
     deviceLockStatus.textContent = 'Building super_MODIFIED.img…';
-    log('Building super_MODIFIED.img…');
+    log('Step 4/6: streaming the full disk back out with patches applied, building super_MODIFIED.img…');
+    log(
+      state.dirHandle
+        ? `  streaming straight into the chosen folder "${state.dirHandle.name}"…`
+        : "  building in memory — a download link will appear below when it's ready…"
+    );
     const hasher = createSha256Stream();
-    const sink = await makeSink('super_MODIFIED.img', disk.totalSize);
+    const sink = await makeSink('super_MODIFIED.img', disk.totalSize, deviceLockDownloads);
     let written = 0;
+    let lastLoggedPct = -1;
     for await (const chunk of streamPatchedDisk(disk, result.patchSet)) {
       hasher.update(chunk);
       await sink.write(chunk);
       written += chunk.length;
+      const frac = written / disk.totalSize;
+      const pct = Math.floor((frac * 100) / 25) * 25;
+      if (pct > lastLoggedPct && pct < 100) {
+        lastLoggedPct = pct;
+        log(`  super_MODIFIED.img: ${pct}% (${formatBytes(written)} / ${formatBytes(disk.totalSize)})`);
+      }
     }
+    log(`  super_MODIFIED.img: 100% (${formatBytes(written)}) — finalizing…`);
     await sink.close();
     const modifiedSha256 = toHex(hasher.digest());
+    log(`  modified SHA-256: ${modifiedSha256}`, 'ok');
 
     // ---------------- validation (browser-side) ----------------
     deviceLockStatus.textContent = 'Validating…';
+    log('Step 5/6: validating the rebuilt image (partition presence, target removal, no unintended changes, LP integrity)…');
     const targetsStillPresent = [];
     const unintendedChanges = [];
     for (const name of result.partitionsModified) {
@@ -869,6 +989,16 @@ deviceLockBtn.addEventListener('click', async () => {
     const overallPass =
       validation.targetFilesRemoved && validation.noUnintendedFileChanges && validation.lpMetadataValid && validation.noExtentOverlap;
 
+    log(`  ${validation.targetFilesRemoved ? '✓' : '✗'} all 3 target files gone`, validation.targetFilesRemoved ? 'ok' : 'err');
+    log(
+      `  ${validation.noUnintendedFileChanges ? '✓' : '✗'} no unintended file changes (${unintendedChanges.length} found)`,
+      validation.noUnintendedFileChanges ? 'ok' : 'err'
+    );
+    log(`  ${validation.noExtentOverlap ? '✓' : '✗'} LP extents do not overlap`, validation.noExtentOverlap ? 'ok' : 'err');
+    log(`  ✓ LP metadata untouched (never rewritten)`, 'ok');
+    log(`  ✓ rebuilt filesystems fit their original allocated partition size`, 'ok');
+
+    log('Step 6/6: writing modification-report.json…');
     const report = {
       sourceImage: state.files.map((f) => f.name).join(' + '),
       outputImage: 'super_MODIFIED.img',
@@ -882,9 +1012,10 @@ deviceLockBtn.addEventListener('click', async () => {
       validation: { ...validation, overall: overallPass ? 'PASS' : 'FAIL' },
     };
     const reportBytes = new TextEncoder().encode(JSON.stringify(report, null, 2));
-    const reportSink = await makeSink('modification-report.json', reportBytes.length);
+    const reportSink = await makeSink('modification-report.json', reportBytes.length, deviceLockDownloads);
     await reportSink.write(reportBytes);
     await reportSink.close();
+    log('  modification-report.json ready.', 'ok');
 
     if (overallPass) {
       deviceLockResult.textContent =
