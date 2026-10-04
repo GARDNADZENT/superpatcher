@@ -12,6 +12,7 @@ import {
   DeviceLockRemovalError,
 } from './device-lock-removal.js';
 import { createSha256Stream, toHex } from './sha256.js';
+import { createStreamingDownloadSink, supportsStreamingDownload } from './stream-download.js';
 import {
   supportsDirectoryPicker,
   supportsSaveFilePicker,
@@ -261,12 +262,18 @@ if (inIframe) {
 }
 
 const fsapiBadge = $('fsapi-badge');
-if (supportsDirectoryPicker()) {
-  fsapiBadge.textContent = inIframe ? 'folder save (needs a new tab, see note above)' : 'folder save supported';
-  fsapiBadge.classList.add(inIframe ? 'warn' : 'good');
+if (supportsDirectoryPicker() && !inIframe) {
+  fsapiBadge.textContent = 'folder save supported';
+  fsapiBadge.classList.add('good');
+} else if (supportsDirectoryPicker() && inIframe) {
+  fsapiBadge.textContent = 'automatic streaming download (open in a new tab to pick a folder instead)';
+  fsapiBadge.classList.add('good');
+} else if (supportsStreamingDownload()) {
+  fsapiBadge.textContent = 'automatic streaming download supported';
+  fsapiBadge.classList.add('good');
 } else if (supportsSaveFilePicker()) {
-  fsapiBadge.textContent = inIframe ? 'per-file save (needs a new tab, see note above)' : 'per-file save supported';
-  fsapiBadge.classList.add(inIframe ? 'warn' : 'good');
+  fsapiBadge.textContent = 'per-file save supported';
+  fsapiBadge.classList.add('good');
 } else {
   fsapiBadge.textContent = 'falling back to downloads (large files may use lots of memory)';
   fsapiBadge.classList.add('warn');
@@ -289,10 +296,9 @@ function explainPickerFailure(err) {
 $('chooseDirBtn').addEventListener('click', async () => {
   if (!supportsDirectoryPicker()) {
     log(
-      'This browser/context does not support choosing a folder (File System Access API). ' +
-        (inIframe
-          ? 'Open this app in a new tab (link above) to try again, or just extract now — files will download individually instead.'
-          : 'Extraction will fall back to per-file downloads instead.'),
+      'This browser/context does not support picking a specific folder (File System Access API). ' +
+        'That\'s fine — nothing extra to do: files will stream automatically into your Downloads folder ' +
+        (inIframe ? 'instead (or open this app in a new tab, linked above, if you do want to pick a folder).' : 'instead.'),
       'warn'
     );
     return;
@@ -321,16 +327,31 @@ function fallbackDownloadSink(filename) {
   return blobDownloadSink(filename, {
     onLargeSizeWarning: (bytes) =>
       log(
-        `"${filename}" has buffered ${formatBytes(bytes)} in memory (no folder was chosen). ` +
-          `Your browser tab may run out of memory for very large partitions.`,
+        `"${filename}" has buffered ${formatBytes(bytes)} in memory (no folder was chosen, and streaming ` +
+          `downloads aren't available in this browser). Your browser tab may run out of memory for very ` +
+          `large partitions.`,
         'warn'
       ),
   });
 }
 
-async function makeSink(filename) {
+async function makeSink(filename, totalSizeBytes = null) {
   if (state.dirHandle) {
     return directorySink(state.dirHandle, filename);
+  }
+  if (supportsStreamingDownload()) {
+    // No folder picker, no dialog, no buffering the whole file in memory:
+    // streams straight into a normal, automatic browser download (the
+    // user's default Downloads folder), via a small service worker. This
+    // is the best available option whenever the user hasn't explicitly
+    // picked an output folder, and works in browsers/contexts (Firefox,
+    // Safari, iframed Chrome/Edge) where the File System Access API
+    // folder/file pickers are unavailable or blocked.
+    try {
+      return await createStreamingDownloadSink(filename, totalSizeBytes);
+    } catch (err) {
+      log(`Streaming download unavailable for "${filename}" (${err.message}); trying another method.`, 'warn');
+    }
   }
   if (supportsSaveFilePicker()) {
     // showSaveFilePicker needs "transient activation" (a recent user
@@ -348,6 +369,7 @@ async function makeSink(filename) {
   }
   return fallbackDownloadSink(filename);
 }
+
 
 function addProgressRow(name, container = progressList) {
   const row = document.createElement('div');
@@ -399,7 +421,7 @@ extractBtn.addEventListener('click', async () => {
     const totalBytes = partitionSizeBytes(meta, partition);
     log(`Extracting "${name}" (${formatBytes(totalBytes)})…`);
     try {
-      const sink = await makeSink(`${name}.img`);
+      const sink = await makeSink(`${name}.img`, Number(totalBytes));
       await extractPartition(disk, meta, partition, sink, {
         onProgress: (written, total) => {
           if (total > 0n) ui.setProgress(Number(written) / Number(total));
@@ -446,13 +468,97 @@ function pluginPill(flagged) {
   return flagged ? '<span class="pill plugin-yes">security-plugin-like name</span>' : '';
 }
 
+const scanSearchRow = $('scanSearchRow');
+const scanSearchInput = $('scanSearchInput');
+const scanSearchCount = $('scanSearchCount');
+const selectedApksPanel = $('selectedApksPanel');
+const selectedApksBody = $('selectedApksBody');
+const selectedApksCount = $('selectedApksCount');
+
 function updateRemoveButtonState() {
   const anyChecked = !!scanResults.querySelector('input.apk-select:checked');
   $('removeBtn').disabled = !anyChecked;
+  updateSelectedApksPanel();
 }
+
+/** Renders the "Selected APKs" panel below the scan results from whichever
+ * checkboxes are currently checked, so the user can review exactly what
+ * will be removed before clicking "Remove selected". */
+function updateSelectedApksPanel() {
+  const report = state.lastScanReport;
+  if (!report) {
+    selectedApksPanel.classList.add('hidden');
+    return;
+  }
+  selectedApksPanel.classList.remove('hidden');
+
+  const checked = Array.from(scanResults.querySelectorAll('input.apk-select:checked'));
+  selectedApksCount.textContent = `${checked.length} selected`;
+
+  if (!checked.length) {
+    selectedApksBody.innerHTML = '<div class="selected-empty">No apps selected yet — check the box next to any app above.</div>';
+    return;
+  }
+
+  selectedApksBody.innerHTML = checked
+    .map((cb) => {
+      const partIdx = Number(cb.dataset.partIdx);
+      const apkIdx = Number(cb.dataset.apkIdx);
+      const partResult = report[partIdx];
+      const apk = partResult?.apks?.[apkIdx];
+      if (!apk) return '';
+      return `
+        <div class="selected-row">
+          <span class="mono">${escapeHtml(partResult.partitionName)}</span>
+          <span class="mono muted">${escapeHtml(apk.path)}</span>
+          <span class="mono">${escapeHtml(apk.packageName ?? '—')}</span>
+          ${deviceAdminPill(apk.deviceAdmin ?? 'unknown')} ${pluginPill(apk.looksLikeSecurityPlugin)}
+        </div>
+      `;
+    })
+    .join('');
+}
+
+/** Live-filters every rendered scan-results row (and hides now-empty
+ * partition headings) against the search box, matching on path, package,
+ * app label, and notes. Attached once; works against whatever is currently
+ * rendered, so it keeps working after re-scans without re-attaching. */
+function applyScanSearchFilter() {
+  const query = scanSearchInput.value.trim().toLowerCase();
+  const headings = Array.from(scanResults.querySelectorAll('.scan-partition-heading'));
+  const tables = Array.from(scanResults.querySelectorAll('table'));
+  let totalRows = 0;
+  let visibleRows = 0;
+
+  tables.forEach((table, i) => {
+    const rows = Array.from(table.querySelectorAll('tbody tr'));
+    let anyVisible = false;
+    rows.forEach((tr) => {
+      totalRows++;
+      const match = !query || (tr.dataset.search || '').includes(query);
+      tr.classList.toggle('search-hidden', !match);
+      if (match) {
+        visibleRows++;
+        anyVisible = true;
+      }
+    });
+    // Each table is immediately preceded by its partition's heading (and
+    // any warning lines) in DOM order; hide the heading too when a search
+    // filters out every row underneath it.
+    const heading = headings[i];
+    if (heading) heading.classList.toggle('search-hidden', query !== '' && !anyVisible);
+    table.classList.toggle('search-hidden', query !== '' && !anyVisible);
+  });
+
+  scanSearchCount.textContent = query ? `${visibleRows} / ${totalRows} match` : '';
+}
+scanSearchInput.addEventListener('input', applyScanSearchFilter);
 
 function renderScanResults(report) {
   scanResults.innerHTML = '';
+  scanSearchInput.value = '';
+  scanSearchCount.textContent = '';
+
   report.forEach((partResult, partIdx) => {
     const heading = document.createElement('div');
     heading.className = 'scan-partition-heading';
@@ -492,6 +598,10 @@ function renderScanResults(report) {
       const checkboxCell = removable
         ? `<input type="checkbox" class="apk-select" data-part-idx="${partIdx}" data-apk-idx="${apkIdx}" ${preChecked ? 'checked' : ''} />`
         : '';
+      tr.dataset.search = [apk.path, apk.packageName, apk.appLabel, partResult.partitionName, notes.join(' ')]
+        .filter(Boolean)
+        .join(' ')
+        .toLowerCase();
       tr.innerHTML = `
         <td>${checkboxCell}</td>
         <td class="name">${escapeHtml(apk.path)}</td>
@@ -512,6 +622,8 @@ function renderScanResults(report) {
   const removeCard = $('removeCard');
   const anyRemovable = report.some((r) => r.volume && r.apks.some((a) => a.removalUnit));
   removeCard.classList.toggle('hidden', !anyRemovable);
+  const totalApks = report.reduce((a, r) => a + r.apks.length, 0);
+  scanSearchRow.classList.toggle('hidden', totalApks === 0);
   updateRemoveButtonState();
 }
 
@@ -634,7 +746,7 @@ removeBtn.addEventListener('click', async () => {
 
   try {
     const ui = addProgressRow('super_patched.img', removeProgress);
-    const sink = await makeSink('super_patched.img');
+    const sink = await makeSink('super_patched.img', state.disk.totalSize);
     const { disk, patchSet } = state;
     let written = 0;
     for await (const chunk of streamPatchedDisk(disk, patchSet)) {
@@ -712,7 +824,7 @@ deviceLockBtn.addEventListener('click', async () => {
     deviceLockStatus.textContent = 'Building super_MODIFIED.img…';
     log('Building super_MODIFIED.img…');
     const hasher = createSha256Stream();
-    const sink = await makeSink('super_MODIFIED.img');
+    const sink = await makeSink('super_MODIFIED.img', disk.totalSize);
     let written = 0;
     for await (const chunk of streamPatchedDisk(disk, result.patchSet)) {
       hasher.update(chunk);
@@ -769,8 +881,9 @@ deviceLockBtn.addEventListener('click', async () => {
       rebuiltPartitionSizes: result.rebuiltPartitionSizes,
       validation: { ...validation, overall: overallPass ? 'PASS' : 'FAIL' },
     };
-    const reportSink = await makeSink('modification-report.json');
-    await reportSink.write(new TextEncoder().encode(JSON.stringify(report, null, 2)));
+    const reportBytes = new TextEncoder().encode(JSON.stringify(report, null, 2));
+    const reportSink = await makeSink('modification-report.json', reportBytes.length);
+    await reportSink.write(reportBytes);
     await reportSink.close();
 
     if (overallPass) {

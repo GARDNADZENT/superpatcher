@@ -28,29 +28,29 @@
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
       line-height: 1.45;
     }
-    .wrap { max-width: 1040px; margin: 0 auto; padding: 32px 20px 80px; }
+    .wrap { max-width: 980px; margin: 0 auto; padding: 20px 16px 50px; font-size: 14px; }
     header h1 {
-      font-size: 24px;
-      margin: 0 0 4px;
+      font-size: 21px;
+      margin: 0 0 3px;
       background: linear-gradient(90deg, var(--accent), var(--accent-2));
       -webkit-background-clip: text;
       background-clip: text;
       color: transparent;
     }
-    header p { color: var(--muted); margin: 0 0 24px; max-width: 760px; }
+    header p { color: var(--muted); margin: 0 0 16px; max-width: 760px; font-size: 13px; }
     .card {
       background: var(--panel);
       border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 20px;
-      margin-bottom: 20px;
+      border-radius: 10px;
+      padding: 14px 16px;
+      margin-bottom: 14px;
     }
     .card h2 {
-      font-size: 14px;
+      font-size: 12.5px;
       text-transform: uppercase;
       letter-spacing: 0.06em;
       color: var(--muted);
-      margin: 0 0 14px;
+      margin: 0 0 10px;
       display: flex;
       align-items: center;
       gap: 8px;
@@ -66,11 +66,11 @@
     }
     .badge.good { color: var(--good); border-color: #1f5f4a; background: #10261f; }
     .badge.warn { color: var(--warn); border-color: #5f4a1f; background: #2a2010; }
-    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
     .file-drop {
       border: 1.5px dashed var(--border);
       border-radius: 10px;
-      padding: 24px;
+      padding: 16px;
       text-align: center;
       color: var(--muted);
       cursor: pointer;
@@ -83,9 +83,10 @@
     .file-list div:last-child { border-bottom: none; }
     button {
       font: inherit;
+      font-size: 13px;
       border: none;
-      border-radius: 8px;
-      padding: 10px 16px;
+      border-radius: 7px;
+      padding: 7px 13px;
       cursor: pointer;
       color: white;
       background: var(--accent);
@@ -97,19 +98,20 @@
     button.danger { background: #3a1f1f; color: var(--bad); border: 1px solid #5f2a2a; }
     .muted { color: var(--muted); }
     .mono { font-family: var(--mono); }
-    table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+    table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
     thead th {
       text-align: left;
       color: var(--muted);
       font-weight: 600;
-      font-size: 11.5px;
+      font-size: 11px;
       text-transform: uppercase;
       letter-spacing: .05em;
-      padding: 6px 8px;
+      padding: 5px 7px;
       border-bottom: 1px solid var(--border);
     }
-    tbody td { padding: 7px 8px; border-bottom: 1px solid #1d232c; vertical-align: middle; }
+    tbody td { padding: 5px 7px; border-bottom: 1px solid #1d232c; vertical-align: middle; }
     tbody tr:hover { background: #131926; }
+    tbody tr.search-hidden { display: none; }
     td.name { font-family: var(--mono); }
     td.attrs { color: var(--muted); font-size: 12px; }
     .size { font-variant-numeric: tabular-nums; color: var(--text); }
@@ -123,17 +125,70 @@
       background: #2a1414;
       color: var(--text);
       border-radius: 10px;
-      padding: 14px 16px;
-      margin: 14px 0;
-      font-size: 13px;
+      padding: 10px 14px;
+      margin: 10px 0;
+      font-size: 12.5px;
     }
     .callout strong { color: var(--bad); }
     .callout ul { margin: 8px 0 0; padding-left: 20px; }
     .callout li { margin-bottom: 4px; }
-    .scan-partition-heading { font-weight: 600; color: var(--text); margin: 16px 0 6px; font-size: 13px; }
+    .scan-partition-heading { font-weight: 600; color: var(--text); margin: 12px 0 5px; font-size: 12.5px; }
     .scan-partition-heading:first-child { margin-top: 0; }
-    .scan-warning { color: var(--warn); font-size: 12px; margin: 4px 0 10px; }
-    .scan-empty { color: var(--muted); font-size: 12.5px; margin: 4px 0 10px; }
+    .scan-partition-heading.search-hidden { display: none; }
+    .scan-warning { color: var(--warn); font-size: 12px; margin: 4px 0 8px; }
+    .scan-empty { color: var(--muted); font-size: 12.5px; margin: 4px 0 8px; }
+    .scan-search {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 12px;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 6px 10px;
+    }
+    .scan-search input {
+      flex: 1;
+      font: inherit;
+      font-size: 13px;
+      background: transparent;
+      border: none;
+      outline: none;
+      color: var(--text);
+    }
+    .scan-search input::placeholder { color: var(--muted); }
+    .scan-search .muted { font-size: 12px; white-space: nowrap; }
+    .selected-apks-panel {
+      margin-top: 14px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+    }
+    .selected-apks-panel .tab-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 8px 12px;
+      background: var(--panel-2);
+      font-size: 11.5px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+      color: var(--muted);
+    }
+    .selected-apks-panel .tab-body { padding: 8px 12px; }
+    .selected-apks-panel .selected-row {
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+      padding: 4px 0;
+      border-bottom: 1px solid #1d232c;
+      font-size: 12.5px;
+      flex-wrap: wrap;
+    }
+    .selected-apks-panel .selected-row:last-child { border-bottom: none; }
+    .selected-apks-panel .selected-empty { color: var(--muted); font-size: 12.5px; padding: 2px 0; }
     .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; gap: 10px; flex-wrap: wrap; }
     .progress-row { display: grid; grid-template-columns: 160px 1fr 90px; gap: 10px; align-items: center; padding: 6px 0; font-size: 12.5px; }
     .progress-track { height: 8px; border-radius: 999px; background: #0c0f14; overflow: hidden; border: 1px solid var(--border); }
@@ -142,12 +197,12 @@
     .progress-fill.error { background: var(--bad); }
     #log {
       font-family: var(--mono);
-      font-size: 12px;
+      font-size: 11.5px;
       background: #0b0e13;
       border: 1px solid var(--border);
       border-radius: 10px;
-      padding: 12px 14px;
-      height: 180px;
+      padding: 10px 12px;
+      height: 140px;
       overflow-y: auto;
       white-space: pre-wrap;
       color: #aeb6c2;
@@ -176,9 +231,11 @@
     <section class="card">
       <h2>1. Select image file(s) <span class="badge" id="fsapi-badge">checking save support…</span></h2>
       <div id="iframeNotice" class="row hidden" style="background:#20283a; border:1px solid #30405f; border-radius:8px; padding:10px 14px; margin-bottom:14px; font-size:13px;">
-        <span>⚠️ This preview is running inside an embedded frame, where browsers block the "save to folder" picker for security reasons.</span>
+        <span>ℹ️ This preview is embedded in a frame, so the browser's folder picker is unavailable here — saved
+          files will automatically stream into your normal <strong>Downloads</strong> folder instead (no size
+          limit, no manual steps needed).</span>
         <a id="openInTabLink" href="#" target="_blank" rel="noopener" style="color:var(--accent); font-weight:600; white-space:nowrap;">Open in a new tab ↗</a>
-        <span class="muted">for full folder-saving support.</span>
+        <span class="muted">if you'd rather pick your own output folder.</span>
       </div>
       <div class="file-drop" id="dropZone">
         <input id="fileInput" type="file" multiple />
@@ -221,10 +278,10 @@
     </section>
 
     <section class="card hidden" id="extractCard">
-      <h2>3. Choose where to save &amp; extract</h2>
+      <h2>3. Extract <span class="muted" style="text-transform:none; letter-spacing:normal; font-weight:400;">(saves automatically — no folder needed)</span></h2>
       <div class="row">
-        <button id="chooseDirBtn" class="secondary">Choose output folder…</button>
-        <span class="muted" id="dirStatus">No folder chosen — will fall back to per-file download.</span>
+        <button id="chooseDirBtn" class="secondary">Choose a specific output folder… (optional)</button>
+        <span class="muted" id="dirStatus">No folder chosen — files will stream straight into your Downloads automatically.</span>
       </div>
       <div class="row" style="margin-top:14px;">
         <button id="extractBtn" disabled>Extract selected partitions</button>
@@ -246,7 +303,19 @@
         <button id="scanBtn">Scan selected partitions</button>
         <span class="muted" id="scanStatus"></span>
       </div>
-      <div id="scanResults" style="margin-top:16px;"></div>
+      <div class="scan-search hidden" id="scanSearchRow">
+        <span>🔎</span>
+        <input type="search" id="scanSearchInput" placeholder="Search scanned apps by path, package, or label…" autocomplete="off" />
+        <span class="muted" id="scanSearchCount"></span>
+      </div>
+      <div id="scanResults" style="margin-top:10px;"></div>
+      <div class="selected-apks-panel hidden" id="selectedApksPanel">
+        <div class="tab-head">
+          <span>Selected APKs</span>
+          <span id="selectedApksCount">0 selected</span>
+        </div>
+        <div class="tab-body" id="selectedApksBody"></div>
+      </div>
     </section>
 
     <section class="card hidden" id="removeCard">

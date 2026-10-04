@@ -24,12 +24,31 @@ images don't need to fit in RAM or ever touch a server.
 - Multiple metadata slots (A/B devices) are selectable from a dropdown.
 - **Saving**, in order of preference:
   1. `showDirectoryPicker()` — pick one output folder, every partition is
-     streamed into it as `<name>.img`. Best option, works for any size.
-  2. `showSaveFilePicker()` — per-file "Save As" dialog, still streamed.
-  3. Classic `<a download>` + `Blob` — universal fallback; buffers the whole
-     partition in memory first, so it's only recommended for smaller
-     partitions in browsers without the File System Access API (e.g. Firefox,
-     Safari).
+     streamed into it as `<name>.img`. Best option, works for any size, but
+     only available on Chromium with a real top-level tab (not embedded in
+     an iframe, and not on Firefox/Safari/most mobile browsers).
+  2. **Automatic streaming download** (`src/stream-download.js` +
+     `public/stream-download-sw.js`) — the default whenever no folder was
+     explicitly chosen and the directory/file pickers above aren't
+     available or usable. A tiny service worker turns the bytes being
+     written into a real, normal browser download (streamed straight to
+     your regular Downloads folder, via a hidden same-origin iframe
+     navigating to a worker-intercepted URL with
+     `Content-Disposition: attachment` — the same technique the
+     battle-tested [StreamSaver.js](https://github.com/jimmywarting/StreamSaver.js)
+     library uses). No folder picker, no dialog, and — thanks to
+     pull-based backpressure between the page and the worker — memory use
+     stays bounded to about one chunk in flight (tens of MB) no matter how
+     large the file is; verified against a real headless-Chrome download of
+     a 640 MiB stream with a flat ~20 MB JS heap throughout and a
+     byte-for-byte SHA-256 match. This is what makes large files safe to
+     build even in browsers/contexts where the folder-picker APIs don't
+     work at all.
+  3. `showSaveFilePicker()` — per-file "Save As" dialog, still streamed.
+  4. Classic `<a download>` + `Blob` — last-resort fallback for the rare
+     browser with neither service workers nor any File System Access API;
+     buffers the whole file in memory first (a clear in-UI warning is shown
+     if this path is ever used for a large file).
 - Live per-partition progress bars, a running log, and cancellation.
 - **Security scan: find Device Administrator-capable & security-plugin-like
   APKs.** Reads directly from a selected partition's filesystem (ext4 or
@@ -103,6 +122,10 @@ src/
 │                    super.img" step streams the whole disk back out with
 │                    all patches applied
 ├── saver.js          File System Access API sinks + Blob-download fallback
+├── stream-download.js  Automatic streaming-download sink (no folder picker
+│                    needed) built on public/stream-download-sw.js, a small
+│                    service worker that turns page-side bytes into a real,
+│                    memory-bounded browser download
 ├── crc32c.js          Castagnoli CRC32 (used for ext4 metadata_csum and the
 │                    EROFS superblock checksum, both recomputed after edits)
 ├── ext4.js             ext4 driver: superblock, 32/64-bit group descriptors,
@@ -179,6 +202,14 @@ each APK's package name, app label, and containing folder/file name
 `com.example.spl` shipped in a folder literally called `SomeVendorPlugin` —
 expect both false positives and false negatives; it is independent of, and
 additional to, the precise manifest-based Device Administrator check.
+
+Once a scan finishes, a **search box** appears above the results to filter
+the (potentially very long) table live by path, package name, app label, or
+partition name — useful for jumping straight to a known app on a partition
+with hundreds of APKs. A **"Selected APKs" panel** below the results always
+shows exactly which apps are currently checked (updating live as you
+(un)check boxes), so you can review the full removal list before clicking
+"Remove selected" without having to scroll back through the whole table.
 
 **Scope decisions for this feature** (deliberate, not oversights):
 - **ext4: no htree directory index traversal.** Android `super.img`
@@ -385,8 +416,15 @@ the same layout the scanner can't read) lives at
   fail to extract (or be scanned) with a clear error message.
 - Sparse major version must be `1` (the only version ever shipped) and LP
   metadata major version must be `10` (current and, to date, only version).
-- The File System Access API (true "save to folder") is Chromium-only today;
-  other browsers fall back to per-file save dialogs or in-memory downloads.
+- The File System Access API (pick-one-folder-and-stream-everything-into-it)
+  is Chromium-only today, and even there it's unavailable inside an
+  embedded/iframed page (no folder picker is allowed in that context by the
+  browser itself, not a bug in this app — look for the "Open in a new tab"
+  link shown when this is detected). Other browsers/contexts automatically
+  use the streaming-download fallback described above instead, which still
+  avoids large in-memory buffering; only the oldest/most unusual browsers
+  (no service worker support at all) fall back further to per-file save
+  dialogs or fully in-memory downloads.
 - Filesystems other than ext4/EROFS (e.g. F2FS, which some older or
   vendor-specific devices use for `super` sub-partitions) aren't recognized
   by the scanner and are skipped with a warning.
