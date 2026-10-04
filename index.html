@@ -96,6 +96,31 @@
     button:disabled { opacity: 0.4; cursor: not-allowed; }
     button.secondary { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); }
     button.danger { background: #3a1f1f; color: var(--bad); border: 1px solid #5f2a2a; }
+    .download-ready {
+      border: 1px solid #1f5f4a;
+      background: #10261f;
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin-top: 8px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      font-size: 13px;
+    }
+    .download-ready .dl-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: var(--good);
+      color: #06241a;
+      font-weight: 600;
+      padding: 7px 13px;
+      border-radius: 7px;
+      text-decoration: none;
+    }
+    .download-ready .dl-link:hover { filter: brightness(1.08); }
+    .download-ready .dl-meta { color: var(--muted); }
     .muted { color: var(--muted); }
     .mono { font-family: var(--mono); }
     table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
@@ -369,6 +394,7 @@
         <span class="muted" id="deviceLockStatus"></span>
       </div>
       <pre id="deviceLockResult" class="mono" style="margin-top:12px; white-space:pre-wrap;"></pre>
+      <div id="deviceLockDownloads"></div>
     </section>
 
     <section class="card">
