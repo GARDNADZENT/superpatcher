@@ -279,6 +279,29 @@
       <div id="removeProgress" style="margin-top:12px;"></div>
     </section>
 
+    <section class="card hidden" id="deviceLockCard">
+      <h2>6. Remove Device Lock Components <span class="badge warn">fixed targets</span></h2>
+      <div class="callout">
+        <strong>What this does.</strong> This action removes exactly three hardcoded files, by their exact path —
+        regardless of what the scan above reports (the scanner can't read some compressed EROFS APKs' contents,
+        so it must never be relied on to decide whether these files exist):
+        <ul>
+          <li><code>product_a/priv-app/SecurityCom/SecurityCom.apk</code> — <code>com.scorpio.securitycom</code></li>
+          <li><code>system_ext_a/app/TranPluginApp/TranPluginApp.apk</code> — <code>com.transsion.spl</code></li>
+          <li><code>system_ext_a/app/TranDaemonApp/TranDaemonApp.apk</code> — <code>com.transsion.spld</code></li>
+        </ul>
+        It verifies all three exist before changing anything (if even one is missing, it stops and reports exactly
+        which, with no changes made), removes only those exact files (never a containing folder, never any other
+        partition/APK/APEX/property), and produces <code>super_MODIFIED.img</code> — the original file is never
+        overwritten. Same AVB/dm-verity/vbmeta caveat as above applies, and this never flashes anything.
+      </div>
+      <div class="row">
+        <button id="deviceLockBtn" disabled>Remove Device Lock Components &amp; build super_MODIFIED.img</button>
+        <span class="muted" id="deviceLockStatus"></span>
+      </div>
+      <pre id="deviceLockResult" class="mono" style="margin-top:12px; white-space:pre-wrap;"></pre>
+    </section>
+
     <section class="card">
       <h2>Log</h2>
       <div id="log"></div>

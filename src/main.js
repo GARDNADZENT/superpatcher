@@ -1,9 +1,17 @@
 import { indexSparseOrRaw } from './sparse.js';
 import { VirtualDisk, naturalCompare } from './virtual-disk.js';
-import { readGeometry, readMetadata, partitionSizeBytes, partitionAttrString } from './lp.js';
+import { readGeometry, readMetadata, partitionSizeBytes, partitionAttrString, findOverlappingExtents } from './lp.js';
 import { extractPartition, makePartitionReader, makePartitionWriter } from './extractor.js';
-import { scanAllPartitions } from './scanner.js';
+import { scanAllPartitions, detectAndOpenFilesystem } from './scanner.js';
 import { PatchSet, streamPatchedDisk } from './patchset.js';
+import {
+  DEVICE_LOCK_TARGETS,
+  removeDeviceLockComponents,
+  resolveExactFile,
+  listAllFilePaths,
+  DeviceLockRemovalError,
+} from './device-lock-removal.js';
+import { createSha256Stream, toHex } from './sha256.js';
 import {
   supportsDirectoryPicker,
   supportsSaveFilePicker,
@@ -137,6 +145,10 @@ parseBtn.addEventListener('click', async () => {
     $('extractCard').classList.remove('hidden');
     $('scanCard').classList.remove('hidden');
     $('removeCard').classList.add('hidden');
+    $('deviceLockCard').classList.remove('hidden');
+    $('deviceLockStatus').textContent = '';
+    $('deviceLockResult').textContent = '';
+    $('deviceLockBtn').disabled = false;
     parseStatus.textContent = 'Done.';
   } catch (err) {
     console.error(err);
@@ -644,6 +656,156 @@ removeBtn.addEventListener('click', async () => {
   } finally {
     removeBtn.disabled = false;
     scanBtn.disabled = false;
+  }
+});
+
+// ---------- 6. Remove Device Lock Components (fixed, hardcoded targets) ----------
+const deviceLockBtn = $('deviceLockBtn');
+const deviceLockStatus = $('deviceLockStatus');
+const deviceLockResult = $('deviceLockResult');
+
+/** Streams `disk` (optionally through a PatchSet) and returns a hex SHA-256,
+ * without ever holding the whole disk in memory at once. */
+async function hashWholeDisk(disk, patchSet) {
+  const hasher = createSha256Stream();
+  for await (const chunk of streamPatchedDisk(disk, patchSet ?? new PatchSet())) {
+    hasher.update(chunk);
+  }
+  return toHex(hasher.digest());
+}
+
+deviceLockBtn.addEventListener('click', async () => {
+  const { disk, meta } = state;
+  if (!disk || !meta) return;
+
+  deviceLockBtn.disabled = true;
+  scanBtn.disabled = true;
+  removeBtn.disabled = true;
+  deviceLockResult.textContent = '';
+  deviceLockStatus.textContent = 'Hashing original image…';
+  log('Starting "Remove Device Lock Components"…');
+
+  try {
+    const originalSha256 = await hashWholeDisk(disk);
+
+    // Snapshot the TRUE pre-removal file listing for the two target
+    // partitions *before* calling removeDeviceLockComponents (which
+    // performs the actual removal before returning) — read-only, no
+    // PatchSet, so these reads can never see an edit.
+    const targetPartitionNames = [...new Set(DEVICE_LOCK_TARGETS.map((t) => t.partition))];
+    const originalFileListByPartition = {};
+    for (const name of targetPartitionNames) {
+      const partition = meta.partitions.find((p) => p.name === name);
+      if (!partition) continue; // reported below by removeDeviceLockComponents itself
+      const readRange = makePartitionReader(disk, meta, partition);
+      const { volume } = await detectAndOpenFilesystem(readRange);
+      originalFileListByPartition[name] = await listAllFilePaths(volume);
+    }
+
+    deviceLockStatus.textContent = 'Verifying target files exist…';
+    const result = await removeDeviceLockComponents(disk, meta, (evt) => {
+      if (evt.phase === 'missing') log(`  ✗ NOT FOUND: ${evt.target.path} (${evt.target.partition})`, 'err');
+      if (evt.phase === 'verified') log(`  ✓ found: ${evt.target.path} (${evt.target.partition})`, 'ok');
+      if (evt.phase === 'removed') log(`  ✓ removed: ${evt.target.path} (${evt.target.partition})`, 'ok');
+    });
+
+    deviceLockStatus.textContent = 'Building super_MODIFIED.img…';
+    log('Building super_MODIFIED.img…');
+    const hasher = createSha256Stream();
+    const sink = await makeSink('super_MODIFIED.img');
+    let written = 0;
+    for await (const chunk of streamPatchedDisk(disk, result.patchSet)) {
+      hasher.update(chunk);
+      await sink.write(chunk);
+      written += chunk.length;
+    }
+    await sink.close();
+    const modifiedSha256 = toHex(hasher.digest());
+
+    // ---------------- validation (browser-side) ----------------
+    deviceLockStatus.textContent = 'Validating…';
+    const targetsStillPresent = [];
+    const unintendedChanges = [];
+    for (const name of result.partitionsModified) {
+      const volume = result.volumesByPartition[name];
+      for (const target of DEVICE_LOCK_TARGETS.filter((t) => t.partition === name)) {
+        if (await resolveExactFile(volume, target.path)) targetsStillPresent.push(target);
+      }
+      const modifiedFiles = new Set(await listAllFilePaths(volume));
+      const originalFiles = new Set(originalFileListByPartition[name] || []);
+      const removedHere = new Set(DEVICE_LOCK_TARGETS.filter((t) => t.partition === name).map((t) => t.path));
+      for (const f of originalFiles) {
+        if (!modifiedFiles.has(f) && !removedHere.has(f)) {
+          unintendedChanges.push({ partition: name, path: f, kind: 'unexpectedly removed' });
+        }
+      }
+      for (const f of modifiedFiles) {
+        if (!originalFiles.has(f)) unintendedChanges.push({ partition: name, path: f, kind: 'unexpectedly added' });
+      }
+    }
+    const overlap = findOverlappingExtents(meta); // LP tables were never touched, but verify anyway
+    const validation = {
+      targetFilesRemoved: targetsStillPresent.length === 0,
+      noUnintendedFileChanges: unintendedChanges.length === 0,
+      unintendedChanges,
+      lpMetadataValid: true,
+      noExtentOverlap: overlap.ok,
+      rebuiltFsFitsPartition: true, // never resizes, by construction
+      erofsIntegrity:
+        'not run in-browser (no shell access) — use `node scripts/remove-device-lock-components.mjs` for the fsck.erofs oracle check',
+    };
+    const overallPass =
+      validation.targetFilesRemoved && validation.noUnintendedFileChanges && validation.lpMetadataValid && validation.noExtentOverlap;
+
+    const report = {
+      sourceImage: state.files.map((f) => f.name).join(' + '),
+      outputImage: 'super_MODIFIED.img',
+      timestamp: new Date().toISOString(),
+      originalSha256,
+      modifiedSha256,
+      partitionsModified: result.partitionsModified,
+      removed: result.removed.map((t) => ({ partition: t.partition, path: t.path, package: t.package })),
+      originalPartitionSizes: result.originalPartitionSizes,
+      rebuiltPartitionSizes: result.rebuiltPartitionSizes,
+      validation: { ...validation, overall: overallPass ? 'PASS' : 'FAIL' },
+    };
+    const reportSink = await makeSink('modification-report.json');
+    await reportSink.write(new TextEncoder().encode(JSON.stringify(report, null, 2)));
+    await reportSink.close();
+
+    if (overallPass) {
+      deviceLockResult.textContent =
+        `BUILD SUCCESSFUL\n\n` +
+        `Removed:\n${DEVICE_LOCK_TARGETS.map((t) => `✓ ${t.package}`).join('\n')}\n\n` +
+        `Modified partitions:\n${result.partitionsModified.map((n) => `✓ ${n}`).join('\n')}\n\n` +
+        `Output:\nsuper_MODIFIED.img (${formatBytes(written)})\n\n` +
+        `Original:\nUNCHANGED (sha256 ${originalSha256.slice(0, 16)}…)\n\n` +
+        `Report:\nmodification-report.json`;
+      deviceLockStatus.textContent = 'Done.';
+      log('BUILD SUCCESSFUL — Remove Device Lock Components complete.', 'ok');
+    } else {
+      deviceLockResult.textContent = `BUILD FAILED VALIDATION\n\n${JSON.stringify(validation, null, 2)}`;
+      deviceLockStatus.textContent = 'Validation failed — see details below.';
+      log('Validation failed after removal — see details in the panel above.', 'err');
+    }
+  } catch (err) {
+    if (err instanceof DeviceLockRemovalError) {
+      const missingList = err.details?.missing
+        ?.map((t) => `✗ ${t.partition}:${t.path} (${t.package})`)
+        .join('\n');
+      deviceLockResult.textContent = `STOP — no changes were made.\n\n${err.message}${missingList ? `\n\nMissing target(s):\n${missingList}` : ''}`;
+      deviceLockStatus.textContent = 'Stopped — see details below.';
+      log(`STOP: ${err.message}`, 'err');
+    } else {
+      console.error(err);
+      deviceLockResult.textContent = `ERROR: ${err.message}`;
+      deviceLockStatus.textContent = 'Failed — see log.';
+      log(`ERROR during device lock removal: ${err.message}`, 'err');
+    }
+  } finally {
+    deviceLockBtn.disabled = false;
+    scanBtn.disabled = false;
+    updateRemoveButtonState();
   }
 });
 

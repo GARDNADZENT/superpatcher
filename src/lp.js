@@ -332,6 +332,34 @@ export function partitionExtentRanges(meta, partition) {
   return ranges;
 }
 
+/**
+ * Validates that no two LINEAR extents (across every partition, on the
+ * loaded block device) overlap in absolute byte-offset space — a basic
+ * dynamic-partition metadata sanity check, independent of any one
+ * partition's own filesystem contents. ZERO (dm-zero) extents occupy no
+ * physical space and are ignored. Extents on a block device other than
+ * #0 (not loaded) are also ignored, since this tool can't address them
+ * anyway.
+ *
+ * @returns {{ok:true}|{ok:false, detail:string}}
+ */
+export function findOverlappingExtents(meta) {
+  const intervals = [];
+  for (const partition of meta.partitions) {
+    for (const range of partitionExtentRanges(meta, partition)) {
+      if (range.type !== 'linear' || range.targetSource !== 0) continue;
+      intervals.push({ start: range.byteOffset, end: range.byteOffset + range.byteLength, partition: partition.name });
+    }
+  }
+  intervals.sort((a, b) => (a.start < b.start ? -1 : a.start > b.start ? 1 : 0));
+  for (let i = 1; i < intervals.length; i++) {
+    if (intervals[i].start < intervals[i - 1].end) {
+      return { ok: false, detail: `"${intervals[i - 1].partition}" and "${intervals[i].partition}" extents overlap` };
+    }
+  }
+  return { ok: true };
+}
+
 export function partitionAttrString(attrs) {
   const flags = [];
   if (attrs & LP_PARTITION_ATTR_READONLY) flags.push('readonly');

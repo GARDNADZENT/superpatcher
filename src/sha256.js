@@ -25,72 +25,152 @@ function rotr(x, n) {
   return (x >>> n) | (x << (32 - n));
 }
 
+const SCRATCH_W = new Uint32Array(64);
+
+/** Processes exactly one 64-byte block at `dv`'s absolute byte `offset`,
+ * updating the 8-word running state `h` in place. Shared by both the
+ * one-shot sha256() below and the incremental hasher, so they're
+ * guaranteed to produce identical digests. */
+function transformBlock(h, dv, offset) {
+  const w = SCRATCH_W;
+  for (let i = 0; i < 16; i++) {
+    w[i] = dv.getUint32(offset + i * 4, false);
+  }
+  for (let i = 16; i < 64; i++) {
+    const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+    const s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+    w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+  }
+
+  let [a, b, c, d, e, f, g, hh] = h;
+
+  for (let i = 0; i < 64; i++) {
+    const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+    const ch = (e & f) ^ (~e & g);
+    const temp1 = (hh + S1 + ch + K[i] + w[i]) >>> 0;
+    const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+    const maj = (a & b) ^ (a & c) ^ (b & c);
+    const temp2 = (S0 + maj) >>> 0;
+
+    hh = g;
+    g = f;
+    f = e;
+    e = (d + temp1) >>> 0;
+    d = c;
+    c = b;
+    b = a;
+    a = (temp1 + temp2) >>> 0;
+  }
+
+  h[0] = (h[0] + a) >>> 0;
+  h[1] = (h[1] + b) >>> 0;
+  h[2] = (h[2] + c) >>> 0;
+  h[3] = (h[3] + d) >>> 0;
+  h[4] = (h[4] + e) >>> 0;
+  h[5] = (h[5] + f) >>> 0;
+  h[6] = (h[6] + g) >>> 0;
+  h[7] = (h[7] + hh) >>> 0;
+}
+
+function finalPaddedBlocks(trailingLen, totalBitLen) {
+  // trailingLen: bytes already in the (sub-64) tail buffer that still need
+  // the 0x80/zero-padding/length-suffix appended, possibly spilling into a
+  // second 64-byte block.
+  const padLen = ((trailingLen + 9 + 63) & ~63) >>> 0;
+  const padded = new Uint8Array(padLen);
+  return { padded, padLen };
+}
+
 /**
  * @param {Uint8Array} message
  * @returns {Uint8Array} 32-byte digest
  */
 export function sha256(message) {
   const bitLen = message.length * 8;
-  // Padding: 0x80, then zeros, then 8-byte big-endian bit length, total
-  // length a multiple of 64 bytes.
   const padLen = ((message.length + 9 + 63) & ~63) >>> 0;
   const padded = new Uint8Array(padLen);
   padded.set(message);
   padded[message.length] = 0x80;
   const dv = new DataView(padded.buffer);
-  // bitLen fits comfortably in 32 bits for anything this tool hashes
-  // (geometry/header/tables are at most a few MB), but handle the high
-  // 32 bits correctly regardless.
   const hi = Math.floor(bitLen / 0x100000000);
   const lo = bitLen >>> 0;
   dv.setUint32(padLen - 8, hi, false);
   dv.setUint32(padLen - 4, lo, false);
 
   const h = H0.slice();
-  const w = new Uint32Array(64);
-
   for (let offset = 0; offset < padded.length; offset += 64) {
-    for (let i = 0; i < 16; i++) {
-      w[i] = dv.getUint32(offset + i * 4, false);
-    }
-    for (let i = 16; i < 64; i++) {
-      const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
-      const s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
-      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
-    }
-
-    let [a, b, c, d, e, f, g, hh] = h;
-
-    for (let i = 0; i < 64; i++) {
-      const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
-      const ch = (e & f) ^ (~e & g);
-      const temp1 = (hh + S1 + ch + K[i] + w[i]) >>> 0;
-      const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
-      const maj = (a & b) ^ (a & c) ^ (b & c);
-      const temp2 = (S0 + maj) >>> 0;
-
-      hh = g;
-      g = f;
-      f = e;
-      e = (d + temp1) >>> 0;
-      d = c;
-      c = b;
-      b = a;
-      a = (temp1 + temp2) >>> 0;
-    }
-
-    h[0] = (h[0] + a) >>> 0;
-    h[1] = (h[1] + b) >>> 0;
-    h[2] = (h[2] + c) >>> 0;
-    h[3] = (h[3] + d) >>> 0;
-    h[4] = (h[4] + e) >>> 0;
-    h[5] = (h[5] + f) >>> 0;
-    h[6] = (h[6] + g) >>> 0;
-    h[7] = (h[7] + hh) >>> 0;
+    transformBlock(h, dv, offset);
   }
 
   const out = new Uint8Array(32);
   const outDv = new DataView(out.buffer);
   for (let i = 0; i < 8; i++) outDv.setUint32(i * 4, h[i], false);
   return out;
+}
+
+/**
+ * Incremental/streaming SHA-256: call update() with successive chunks of
+ * any size (no alignment requirement) without ever holding the whole
+ * message in memory at once, then digest() once at the end. Produces
+ * byte-for-byte the same result as sha256(wholeMessageConcatenated).
+ * Used for hashing whole (potentially multi-gigabyte) super.img files for
+ * the modification report, in bounded-memory chunks consistent with the
+ * rest of this project's streaming design.
+ */
+export function createSha256Stream() {
+  let h = H0.slice();
+  let tail = new Uint8Array(0); // 0-63 bytes carried over between update() calls
+  let totalLen = 0n;
+  let finished = false;
+
+  function update(chunk) {
+    if (finished) throw new Error('createSha256Stream: update() called after digest()');
+    if (!(chunk instanceof Uint8Array)) throw new Error('createSha256Stream: chunk must be a Uint8Array');
+    totalLen += BigInt(chunk.length);
+
+    let data;
+    if (tail.length) {
+      data = new Uint8Array(tail.length + chunk.length);
+      data.set(tail);
+      data.set(chunk, tail.length);
+    } else {
+      data = chunk;
+    }
+
+    const fullLen = data.length - (data.length % 64);
+    if (fullLen > 0) {
+      const dv = new DataView(data.buffer, data.byteOffset, fullLen);
+      for (let offset = 0; offset < fullLen; offset += 64) {
+        transformBlock(h, dv, offset);
+      }
+    }
+    tail = data.length > fullLen ? data.slice(fullLen) : new Uint8Array(0);
+  }
+
+  function digest() {
+    if (finished) throw new Error('createSha256Stream: digest() called twice');
+    finished = true;
+    const bitLen = totalLen * 8n;
+    const { padded, padLen } = finalPaddedBlocks(tail.length, bitLen);
+    padded.set(tail);
+    padded[tail.length] = 0x80;
+    const dv = new DataView(padded.buffer);
+    const hi = Number(bitLen >> 32n) >>> 0;
+    const lo = Number(bitLen & 0xffffffffn) >>> 0;
+    dv.setUint32(padLen - 8, hi, false);
+    dv.setUint32(padLen - 4, lo, false);
+    for (let offset = 0; offset < padded.length; offset += 64) {
+      transformBlock(h, dv, offset);
+    }
+    const out = new Uint8Array(32);
+    const outDv = new DataView(out.buffer);
+    for (let i = 0; i < 8; i++) outDv.setUint32(i * 4, h[i], false);
+    return out;
+  }
+
+  return { update, digest };
+}
+
+export function toHex(bytes) {
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 }

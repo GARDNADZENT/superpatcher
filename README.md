@@ -48,6 +48,13 @@ images don't need to fit in RAM or ever touch a server.
   [Removing flagged apps](#removing-flagged-apps--building-a-patched-superimg)
   below for exactly what this does and does **not** handle (notably: no
   AVB/dm-verity/vbmeta handling).
+- **"Remove Device Lock Components"**: a separate, narrower action that
+  deletes three specific, hardcoded APKs by their exact path — regardless
+  of what the scan reports — for the case where the scan can't read a
+  target's content at all. See
+  [Remove Device Lock Components](#remove-device-lock-components-fixed-targets)
+  below. Also available as a standalone CLI script
+  (`scripts/remove-device-lock-components.mjs`) for automation/testing.
 
 ## Getting started
 
@@ -250,9 +257,124 @@ filesystem" over "reclaim space"):
   on an unlocked bootloader) if you want the patched `super.img` to actually
   boot. This caveat is also shown directly in the UI before you can remove
   anything.
-- **No EROFS compressed-inode editing.** Only `FLAT_PLAIN`/`FLAT_INLINE`
-  directories/files can be removed (matches the scan's own read support,
-  above); a compressed APK can't currently be auto-removed.
+- **Removal only requires the *containing directory* to be
+  `FLAT_PLAIN`/`FLAT_INLINE`** — `removeDirEntry()` edits the parent
+  directory's dirent list, never the removed file's own data, so a
+  **compressed APK can still be removed** even though the scanner can't
+  read its manifest content (see ["Remove Device Lock
+  Components"](#remove-device-lock-components-fixed-targets) below, which
+  exercises exactly this: all three of its hardcoded targets are built as
+  `COMPRESSED_COMPACT` EROFS inodes and are still cleanly removed). The
+  only thing actually blocked is removing an entry whose *parent
+  directory itself* is compressed — directories are essentially never
+  worth compressing, so real-world images don't hit this.
+
+## Remove Device Lock Components (fixed targets)
+
+This is a **separate, narrower action** from the general scan-and-remove
+feature above — not a replacement for it. It exists for one specific,
+real-world case: a scan that reports `deviceAdmin: unknown` / 0 findings
+for an app because its APK is stored as a compressed EROFS inode the
+scanner can't decompress and read. **Directory listings work regardless of
+compression — only reading a file's *content* is affected** — so this
+action locates and removes files by their exact, known path instead of
+relying on the scan's (content-dependent) findings at all.
+
+It removes exactly these three files, and nothing else, ever:
+
+| Partition      | Path                                              | Package                  |
+|----------------|----------------------------------------------------|---------------------------|
+| `product_a`    | `priv-app/SecurityCom/SecurityCom.apk`             | `com.scorpio.securitycom` |
+| `system_ext_a` | `app/TranPluginApp/TranPluginApp.apk`              | `com.transsion.spl`       |
+| `system_ext_a` | `app/TranDaemonApp/TranDaemonApp.apk`              | `com.transsion.spld`      |
+
+**Workflow** (identical in the UI's "6. Remove Device Lock Components" card
+and in `scripts/remove-device-lock-components.mjs`, both built on the same
+`src/device-lock-removal.js` core module):
+
+1. Parse the loaded `super.img`'s LP metadata as usual.
+2. Open `product_a` and `system_ext_a` read-through-patch and confirm both
+   are EROFS (required — this action is hardcoded to this exact partition
+   layout; it refuses to proceed, unmodified, if either is missing or isn't
+   EROFS).
+3. **Verify all three target files exist at their exact path — by walking
+   directory entries directly, never via the scanner — before touching
+   anything.** If even one is missing, the whole operation **stops**
+   immediately with no files written and names exactly which target(s)
+   couldn't be found (this is a strict two-phase verify-then-remove: even
+   if 2 of 3 are found, finding the 3rd missing still aborts with zero
+   changes made).
+4. Remove only each target `.apk` file's own directory entry from its
+   immediate parent folder (`removeDirEntry`) — deliberately **not** the
+   whole containing folder, unlike the general feature's `removalUnit`
+   logic, since every sibling file (decoy apps, `etc/permissions/*.xml`,
+   etc.) must be byte-for-byte preserved.
+5. Stream the entire original disk back out with those patches applied,
+   via the same folder/file-picker/Blob sinks as everything else in this
+   app. The **source file is never overwritten**: output is always named
+   `<original>_MODIFIED.img` (e.g. `super.img` → `super_MODIFIED.img`).
+6. Write a `modification-report.json` next to the output, containing the
+   source/output filenames, an ISO-8601 timestamp, SHA-256 of both the
+   original and modified image, which partitions were touched, the exact
+   3 removed files (`{partition, path, package}`), original vs. rebuilt
+   partition sizes (always identical — see below), and the full validation
+   result.
+7. Validate the result: reparse `*_MODIFIED.img` with this project's own
+   LP/EROFS readers; confirm every original partition (including untouched
+   ones) is still present; confirm the 3 target paths are gone; confirm,
+   by diffing a full pre/post file-path tree per touched partition, that
+   **no other file was added or removed**; confirm no LP extents overlap;
+   confirm each rebuilt filesystem still fits its unchanged, originally
+   allocated partition size. The CLI script additionally shells out to a
+   real `fsck.erofs` (if present on `PATH`) as an independent integrity
+   oracle on both rebuilt partitions — the in-browser UI can't shell out,
+   so it notes that check as skipped and points at the CLI script instead.
+
+Same standing design choices as the general removal feature apply here:
+**original LP metadata/group definitions are reused as-is** (partition
+names, attributes, group names, block size, metadata slots, and extent
+layout are never regenerated/relaid-out — only partition-data bytes already
+allocated to `product_a`/`system_ext_a` are patched in place); no inodes or
+blocks are ever freed, so the rebuilt image is exactly the same size as the
+original; no AVB/dm-verity/vbmeta handling (same caveat as above); and this
+action **never flashes anything** — it only ever produces a local file.
+
+Run it from the command line against any `super.img`:
+
+```bash
+node scripts/remove-device-lock-components.mjs path/to/super.img
+```
+
+On success it prints:
+
+```
+BUILD SUCCESSFUL
+
+Removed:
+✓ com.scorpio.securitycom
+✓ com.transsion.spl
+✓ com.transsion.spld
+
+Modified partitions:
+✓ product_a
+✓ system_ext_a
+
+Output:
+super_MODIFIED.img
+
+Original:
+UNCHANGED
+```
+
+and writes `super_MODIFIED.img` + `modification-report.json` next to the
+source image. If any target can't be located it instead prints a `STOP`
+message naming exactly which file(s), and writes **no** files at all.
+
+A ready-made fixture that contains all three targets (built with real
+`mkfs.erofs -zlz4hc`, so the targets are genuinely `COMPRESSED_COMPACT` —
+the same layout the scanner can't read) lives at
+`sample-data/super_devicelock_demo.img`; rebuild it anytime with
+`node test/build-devicelock-demo-super.mjs`.
 
 ## Known limitations
 
