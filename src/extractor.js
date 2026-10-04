@@ -1,4 +1,5 @@
 import { partitionExtentRanges } from './lp.js';
+import { applyPatches } from './patchset.js';
 
 const MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER);
 
@@ -85,23 +86,13 @@ export async function extractPartition(disk, meta, partition, sink, opts = {}) {
 }
 
 /**
- * Builds a `readRange(offset, length) => Promise<Uint8Array>` function whose
- * offsets are relative to the start of one logical partition, backed
- * directly by the partition's LP extents on the loaded virtual disk — no
- * extraction-to-file needed first. Used by the security scanner to read
- * filesystem structures (superblocks, inodes, directory blocks, file
- * contents) straight out of a partition's byte range.
- *
- * Mirrors extractPartition's extent-walking logic and scope decision: an
- * extent referencing a secondary block device (targetSource !== 0) throws,
- * since only the primary loaded image is available.
- *
- * @param {import('./virtual-disk.js').VirtualDisk} disk
- * @param {object} meta
- * @param {object} partition
+ * Shared logic behind makePartitionReader/makePartitionWriter: resolves a
+ * partition's LP extents into an ordered table of logical-byte-range
+ * segments, each tagged with its absolute disk byte offset (for 'linear'
+ * extents) so partition-relative offsets can be translated in both
+ * directions.
  */
-export function makePartitionReader(disk, meta, partition) {
-  const rawRanges = partitionExtentRanges(meta, partition);
+function buildRangeTable(partition, rawRanges) {
   let cursor = 0;
   const ranges = rawRanges.map((r) => {
     const byteLength = toSafeNumber(r.byteLength, 'extent length');
@@ -116,7 +107,39 @@ export function makePartitionReader(disk, meta, partition) {
     cursor += byteLength;
     return range;
   });
-  const totalLength = cursor;
+  return { ranges, totalLength: cursor };
+}
+
+function findRangeIndex(ranges, pos) {
+  return ranges.findIndex((r) => pos < r.logicalEnd);
+}
+
+/**
+ * Builds a `readRange(offset, length) => Promise<Uint8Array>` function whose
+ * offsets are relative to the start of one logical partition, backed
+ * directly by the partition's LP extents on the loaded virtual disk — no
+ * extraction-to-file needed first. Used by the security scanner to read
+ * filesystem structures (superblocks, inodes, directory blocks, file
+ * contents) straight out of a partition's byte range.
+ *
+ * Mirrors extractPartition's extent-walking logic and scope decision: an
+ * extent referencing a secondary block device (targetSource !== 0) throws,
+ * since only the primary loaded image is available.
+ *
+ * @param {import('./virtual-disk.js').VirtualDisk} disk
+ * @param {object} meta
+ * @param {object} partition
+ * @param {import('./patchset.js').PatchSet} [patchSet] optional — if given,
+ *   reads are overlaid with any patches already recorded (in absolute disk
+ *   offsets), so edits made earlier in the same removal session are visible
+ *   to subsequent reads (e.g. removing two sibling APKs from one directory).
+ */
+export function makePartitionReader(disk, meta, partition, patchSet) {
+  const { ranges, totalLength } = buildRangeTable(partition, partitionExtentRanges(meta, partition));
+
+  const diskRead = patchSet
+    ? async (offset, length) => applyPatches(await disk.read(offset, length), offset, patchSet.patches)
+    : (offset, length) => disk.read(offset, length);
 
   return async function readRange(offset, length) {
     if (offset < 0 || length < 0 || offset + length > totalLength) {
@@ -128,7 +151,7 @@ export function makePartitionReader(disk, meta, partition) {
     if (length === 0) return out;
     let filled = 0;
     let pos = offset;
-    let idx = ranges.findIndex((r) => pos < r.logicalEnd);
+    let idx = findRangeIndex(ranges, pos);
     while (filled < length) {
       const r = ranges[idx];
       const segEnd = Math.min(offset + length, r.logicalEnd);
@@ -143,7 +166,7 @@ export function makePartitionReader(disk, meta, partition) {
           );
         }
         const diskOffset = r.byteOffset + (pos - r.logicalStart);
-        const bytes = await disk.read(diskOffset, segLen);
+        const bytes = await diskRead(diskOffset, segLen);
         out.set(bytes, filled);
       }
       filled += segLen;
@@ -151,5 +174,59 @@ export function makePartitionReader(disk, meta, partition) {
       idx++;
     }
     return out;
+  };
+}
+
+/**
+ * Builds a `writeRange(offset, bytes)` function whose offsets are relative
+ * to the start of one logical partition. Rather than mutating anything, it
+ * translates the partition-relative write into one or more absolute
+ * disk-offset patches recorded into `patchSet` — the original (immutable,
+ * File-backed) disk is never touched; the edit only becomes real bytes when
+ * the patched disk is later streamed out via streamPatchedDisk().
+ *
+ * Throws if the write would land on a 'zero' (dm-zero) extent, or on a
+ * secondary block device — neither should ever happen for our use case
+ * (patching bytes inside already-allocated filesystem metadata blocks).
+ *
+ * @param {import('./virtual-disk.js').VirtualDisk} disk
+ * @param {object} meta
+ * @param {object} partition
+ * @param {import('./patchset.js').PatchSet} patchSet
+ */
+export function makePartitionWriter(disk, meta, partition, patchSet) {
+  const { ranges, totalLength } = buildRangeTable(partition, partitionExtentRanges(meta, partition));
+
+  return function writeRange(offset, bytes) {
+    const length = bytes.length;
+    if (offset < 0 || length < 0 || offset + length > totalLength) {
+      throw new Error(
+        `Partition "${partition.name}" write out of range: offset=${offset} length=${length} size=${totalLength}`
+      );
+    }
+    if (length === 0) return;
+    let pos = offset;
+    let idx = findRangeIndex(ranges, pos);
+    while (pos < offset + length) {
+      const r = ranges[idx];
+      const segEnd = Math.min(offset + length, r.logicalEnd);
+      const segLen = segEnd - pos;
+      if (r.type === 'zero') {
+        throw new Error(
+          `Partition "${partition.name}" write at offset ${pos} would land on an unallocated (dm-zero) extent; refusing.`
+        );
+      }
+      if (r.targetSource !== 0) {
+        throw new Error(
+          `Partition "${partition.name}" has an extent on block device #${r.targetSource}, but only the ` +
+            `primary super image (block device #0) was loaded; cannot patch this partition.`
+        );
+      }
+      const diskOffset = r.byteOffset + (pos - r.logicalStart);
+      const srcStart = pos - offset;
+      patchSet.addPatch(diskOffset, bytes.subarray(srcStart, srcStart + segLen));
+      pos += segLen;
+      idx++;
+    }
   };
 }
