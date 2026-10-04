@@ -1,0 +1,16 @@
+{
+  "name": "super-unpacker",
+  "version": "1.0.0",
+  "description": "Extract Android super.img (sparse + LP/dynamic-partition metadata) entirely in the browser, saving partitions straight to disk via the File System Access API.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "vite --host 0.0.0.0 --port 5173",
+    "build": "vite build",
+    "preview": "vite preview --host 0.0.0.0 --port 5173",
+    "test": "node --test test/"
+  },
+  "devDependencies": {
+    "vite": "^5.4.11"
+  }
+}
