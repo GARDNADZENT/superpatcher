@@ -31,15 +31,23 @@ images don't need to fit in RAM or ever touch a server.
      partitions in browsers without the File System Access API (e.g. Firefox,
      Safari).
 - Live per-partition progress bars, a running log, and cancellation.
-- **Security scan (read-only): find Device Administrator-capable APKs.**
-  Reads directly from a selected partition's filesystem (ext4 or EROFS,
-  auto-detected from the superblock — no extraction-to-disk required first),
-  walks its directory tree, finds every `.apk`, and parses each one's
-  compiled `AndroidManifest.xml` to flag any app that can register as an
-  Android [Device Administrator](https://developer.android.com/work/dpc/dedicated-devices/receiver-provisioning)
+- **Security scan: find Device Administrator-capable & security-plugin-like
+  APKs.** Reads directly from a selected partition's filesystem (ext4 or
+  EROFS, auto-detected from the superblock — no extraction-to-disk required
+  first), walks its directory tree, finds every `.apk`, and parses each
+  one's compiled `AndroidManifest.xml` to flag any app that can register as
+  an Android [Device Administrator](https://developer.android.com/work/dpc/dedicated-devices/receiver-provisioning)
   (the mechanism behind unremovable "security plugin"-style bloatware, as
-  well as legitimate MDM apps). This phase **only scans and reports** — it
-  never modifies, strips, or repacks any partition image.
+  well as legitimate MDM apps). A separate, looser naming heuristic also
+  flags apps whose package/label/folder name looks security- or
+  plugin-related. Scanning itself never modifies anything.
+- **Remove flagged apps & build a patched `super.img`.** For apps found
+  during the scan, the tool can delete their files directly from the
+  in-memory filesystem image (ext4 or EROFS) and stream out a new, patched
+  `super.img` of the same size, ready to `fastboot flash super`. See
+  [Removing flagged apps](#removing-flagged-apps--building-a-patched-superimg)
+  below for exactly what this does and does **not** handle (notably: no
+  AVB/dm-verity/vbmeta handling).
 
 ## Getting started
 
@@ -57,8 +65,8 @@ images are included:
 - `sample-data/super_demo.img` — 2 partitions (`system_a` on real ext4,
   `product_a` on real EROFS), each containing real APKs including one that
   registers as a Device Administrator — use this one to try out the
-  "4. Security scan" feature end-to-end. Regenerate it any time with
-  `node test/build-demo-super.mjs`.
+  "4. Security scan" and "5. Remove flagged apps" features end-to-end.
+  Regenerate it any time with `node test/build-demo-super.mjs`.
 
 ```bash
 npm run build     # production build to dist/
@@ -75,23 +83,45 @@ src/
 ├── lp.js            liblp metadata format: geometry, header, partition/
 │                    extent/group/block-device tables, checksum verification
 ├── extractor.js      Resolves a partition's extents and streams its bytes;
-│                    also exposes makePartitionReader() for random-access
-│                    reads straight off a partition's extents (used by the
-│                    security scanner, no extraction-to-disk needed)
+│                    also exposes makePartitionReader()/makePartitionWriter()
+│                    for random-access reads/writes straight off a
+│                    partition's extents (used by the scanner/remover, no
+│                    extraction-to-disk needed; writes go through a PatchSet,
+│                    never touching the original loaded file)
+├── patchset.js        A small sparse "patch overlay": records removal edits
+│                    as (absolute disk offset, bytes) pairs against the
+│                    loaded disk without ever mutating the original
+│                    (immutable, File-backed) source, so reads during
+│                    removal see prior edits, and the final "build patched
+│                    super.img" step streams the whole disk back out with
+│                    all patches applied
 ├── saver.js          File System Access API sinks + Blob-download fallback
-├── ext4.js            Read-only ext4 driver: superblock, 32/64-bit group
-│                    descriptors, extent-tree block mapping, classic
-│                    (linear, possibly multi-block) directory parsing
-├── erofs.js           Read-only EROFS driver: superblock, compact/extended
-│                    inodes, FLAT_PLAIN/FLAT_INLINE file & directory reads
+├── crc32c.js          Castagnoli CRC32 (used for ext4 metadata_csum and the
+│                    EROFS superblock checksum, both recomputed after edits)
+├── ext4.js             ext4 driver: superblock, 32/64-bit group descriptors,
+│                    extent-tree block mapping, classic (linear, possibly
+│                    multi-block) directory parsing — plus write support:
+│                    removeDirEntry() patches a directory's dirent chain
+│                    in place (merging the freed slot into a neighbor's
+│                    rec_len, ext4's own on-disk convention) and recomputes
+│                    any affected metadata_csum
+├── erofs.js            EROFS driver: superblock, compact/extended inodes,
+│                    FLAT_PLAIN/FLAT_INLINE file & directory reads — plus
+│                    write support: removeDirEntry() rebuilds a directory's
+│                    entire content from its surviving entries (EROFS has no
+│                    per-entry slack to merge into, unlike ext4) and
+│                    recomputes the whole-superblock CRC32-C checksum
 ├── zip.js             Minimal read-only ZIP reader (stored + deflate) for
 │                    extracting AndroidManifest.xml out of APKs
 ├── axml.js            Parses compiled Android binary XML (AXML) to pull out
 │                    the package name, app label, and Device Administrator
 │                    receiver declarations from AndroidManifest.xml
 ├── scanner.js          Orchestrates the above: fs-type auto-detect -> walk
-│                    -> .apk discovery -> zip+axml -> device-admin report
-└── main.js           UI wiring
+│                    -> .apk discovery -> zip+axml -> device-admin +
+│                    security-plugin-name report, with a removalUnit
+│                    (which directory/file to delete) attached per APK
+└── main.js           UI wiring, including the "remove selected & build
+                     patched super.img" flow
 ```
 
 The on-disk layout `lp.js` parses (per AOSP's `liblp`):
@@ -135,11 +165,15 @@ its contents couldn't be read at all, e.g. unsupported compression — see
 below), with its package name, app label, and the matching receiver's class
 name when applicable.
 
+Separately, `looksLikeSecurityPlugin` runs a looser, best-effort regex over
+each APK's package name, app label, and containing folder/file name
+(`security`, `admin`, `polic(y|ies)`, `mdm`, `plugin`, `guard`, `protect`,
+...). It's a naming *hint* meant to also catch apps like a hypothetical
+`com.example.spl` shipped in a folder literally called `SomeVendorPlugin` —
+expect both false positives and false negatives; it is independent of, and
+additional to, the precise manifest-based Device Administrator check.
+
 **Scope decisions for this feature** (deliberate, not oversights):
-- **Scan-only.** Nothing here modifies, strips, or repacks the loaded image.
-  Removing a flagged app would require rewriting the filesystem and
-  recomputing/replacing the partition in the LP metadata, which is out of
-  scope for this phase.
 - **ext4: no htree directory index traversal.** Android `super.img`
   partitions are built by offline `mkfs`-style tooling, which always lays
   out directories linearly (classic/linear dirents) even when the on-disk
@@ -163,6 +197,63 @@ name when applicable.
 - **No ZIP64 support** in `zip.js` — irrelevant for APKs, which are always
   well under the 4 GiB ZIP64 threshold.
 
+## Removing flagged apps & building a patched super.img
+
+⚠️ **Read this before flashing anything.** This feature can produce a
+`super.img` that **fails to boot** unless you separately handle Android
+Verified Boot. Keep a backup of your original `super.img`.
+
+After a scan, each APK with a `removalUnit` gets a checkbox (pre-checked for
+`deviceAdmin: yes` and security-plugin-name matches). Clicking "Remove
+selected & build patched super.img":
+
+1. Calls `volume.removeDirEntry(parentInode, entryName)` for each selected
+   app's removal unit. This is computed by the scanner as:
+   - the APK's own dedicated containing folder (e.g. `ScorpioSecurity/` in
+     `/system/app/ScorpioSecurity/ScorpioSecurity.apk`) — the universal
+     Android packaging convention, and what's removed in the overwhelming
+     majority of cases; or
+   - just the `.apk` file itself, if it's found loose directly inside a
+     shared container directory (`app/`, `priv-app/`, `overlay/`, etc. —
+     never removed as a whole, since that would delete every app in it).
+2. Every edit is recorded in a `PatchSet` as `(absolute offset, bytes)`
+   pairs — the original loaded file is **never** mutated, so a failed or
+   cancelled run leaves nothing changed. Both `ext4.js` and `erofs.js`
+   additionally recompute any affected on-disk checksums (ext4
+   `metadata_csum` on the touched directory block/inode; the EROFS
+   whole-superblock CRC32-C when the compat feature bit is set), verified
+   against real `e2fsck`/`fsck.erofs` oracles in `test/`.
+3. "Build patched super.img" streams the *entire* original disk back out
+   (`streamPatchedDisk`) with all recorded patches applied, through the same
+   folder/file-picker/Blob sinks used for extraction.
+
+**Deliberate, minimal-risk design choices** (prioritizing "don't corrupt the
+filesystem" over "reclaim space"):
+- **Never frees inodes or data blocks.** The removed app's inode and blocks
+  are simply abandoned (unlinked from their directory, left allocated but
+  unreferenced) rather than updating the free-space bitmaps/counters. This
+  is why `e2fsck -fn` reports (and this project's tests explicitly expect
+  and whitelist) harmless "Unattached inode" / "Block bitmap differences" /
+  "Inode bitmap differences" / "Directories count wrong" findings on a
+  patched image — these are inert, pre-existing-pattern-safe leftovers,
+  never a checksum mismatch or structural corruption.
+- **Never resizes partitions or touches LP metadata.** The patched image is
+  byte-for-byte the same size and partition layout as the original; only
+  bytes inside already-allocated filesystem metadata (directory blocks,
+  inode fields, superblock checksums) are patched.
+- **No AVB / dm-verity / vbmeta handling, by design.** Changing partition
+  contents breaks its dm-verity hash tree and/or AVB hash descriptor. This
+  tool does not disable verity, strip AVB, or re-sign `vbmeta` — that
+  remains an entirely separate, manual, device-specific step you must do
+  yourself (typically something like
+  `fastboot --disable-verity --disable-verification flash vbmeta vbmeta.img`
+  on an unlocked bootloader) if you want the patched `super.img` to actually
+  boot. This caveat is also shown directly in the UI before you can remove
+  anything.
+- **No EROFS compressed-inode editing.** Only `FLAT_PLAIN`/`FLAT_INLINE`
+  directories/files can be removed (matches the scan's own read support,
+  above); a compressed APK can't currently be auto-removed.
+
 ## Known limitations
 
 - Only block device index 0 (the image(s) you actually loaded) can be read.
@@ -177,6 +268,12 @@ name when applicable.
 - Filesystems other than ext4/EROFS (e.g. F2FS, which some older or
   vendor-specific devices use for `super` sub-partitions) aren't recognized
   by the scanner and are skipped with a warning.
+- Removal/patching does not touch AVB/dm-verity/vbmeta (see above) — a
+  patched image generally will not boot as-is on a device with verified
+  boot enforced, until you separately handle that yourself.
+- Removal does not reclaim storage space; the patched `super.img` is the
+  same size as the original with the removed app's blocks left allocated
+  but unreferenced.
 
 ## License
 

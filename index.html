@@ -117,6 +117,19 @@
     .pill.admin-yes { color: var(--bad); border-color: #5f2a2a; background: #2a1414; }
     .pill.admin-no { color: var(--good); border-color: #1f5f4a; background: #10261f; }
     .pill.admin-unknown { color: var(--warn); border-color: #5f4a1f; background: #2a2010; }
+    .pill.plugin-yes { color: var(--warn); border-color: #5f4a1f; background: #2a2010; }
+    .callout {
+      border: 1px solid #5f2a2a;
+      background: #2a1414;
+      color: var(--text);
+      border-radius: 10px;
+      padding: 14px 16px;
+      margin: 14px 0;
+      font-size: 13px;
+    }
+    .callout strong { color: var(--bad); }
+    .callout ul { margin: 8px 0 0; padding-left: 20px; }
+    .callout li { margin-bottom: 4px; }
     .scan-partition-heading { font-weight: 600; color: var(--text); margin: 16px 0 6px; font-size: 13px; }
     .scan-partition-heading:first-child { margin-top: 0; }
     .scan-warning { color: var(--warn); font-size: 12px; margin: 4px 0 10px; }
@@ -222,18 +235,48 @@
     </section>
 
     <section class="card hidden" id="scanCard">
-      <h2>4. Security scan — find Device Administrator APKs <span class="badge">read-only, scan only</span></h2>
+      <h2>4. Security scan — find Device Administrator &amp; security-plugin APKs</h2>
       <p class="muted" style="margin-top:-6px;">
         Scans the selected partitions' <strong>file systems directly</strong> (ext4 or EROFS, auto-detected) for
-        <code>.apk</code> files and checks each app's manifest for Device Administrator capability — the mechanism
-        used by unremovable "security"/MDM-style bloatware as well as legitimate MDM apps. This only reads and
-        reports; it does not modify, strip, or repack any partition.
+        <code>.apk</code> files, checks each app's manifest for Device Administrator capability, and flags names
+        that look like security/MDM plugins (a separate, looser heuristic). The scan itself never modifies
+        anything; removal (section 5 below) is a distinct, explicit step.
       </p>
       <div class="row">
         <button id="scanBtn">Scan selected partitions</button>
         <span class="muted" id="scanStatus"></span>
       </div>
       <div id="scanResults" style="margin-top:16px;"></div>
+    </section>
+
+    <section class="card hidden" id="removeCard">
+      <h2>5. Remove flagged apps &amp; build a patched super.img</h2>
+      <div class="callout">
+        <strong>Read before using this.</strong> This tool can delete the selected apps' files from the loaded
+        partition images and produce a new, patched <code>super.img</code> you can flash with
+        <code>fastboot flash super &lt;file&gt;</code>. It cannot and does not:
+        <ul>
+          <li>disable Android Verified Boot (AVB) / dm-verity, or re-sign <code>vbmeta</code> — a partition whose
+            content changed will usually fail its verity hash unless you separately disable verification
+            (e.g. <code>fastboot --disable-verity --disable-verification flash vbmeta vbmeta.img</code>) on an
+            unlocked bootloader;</li>
+          <li>guarantee your device will boot afterward — a mismatched/locked bootloader, A/B slot, or
+            OEM-specific partition layout can still make this unsafe; flash at your own risk and keep a backup
+            of the original <code>super.img</code>;</li>
+          <li>free the removed apps' underlying storage — their data blocks/inodes are simply abandoned in place
+            (never reused by anything), not reclaimed, so the patched image is the same size as the original.</li>
+        </ul>
+      </div>
+      <p class="muted" style="margin-top:-2px;">
+        Checkboxes below are pre-selected for apps flagged as Device Administrator-capable or security-plugin-like;
+        review and adjust before removing. Removal happens in memory against the loaded image; nothing is written
+        back until you build and download the patched file.
+      </p>
+      <div class="row">
+        <button id="removeBtn" disabled>Remove selected &amp; build patched super.img</button>
+        <span class="muted" id="removeStatus"></span>
+      </div>
+      <div id="removeProgress" style="margin-top:12px;"></div>
     </section>
 
     <section class="card">

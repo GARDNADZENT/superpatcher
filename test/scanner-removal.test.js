@@ -56,6 +56,40 @@ async function runE2fsckOracle(u8) {
   return output;
 }
 
+// Same accepted-findings whitelist as test/ext4-write.test.js: the
+// deliberate, documented trade-off of never freeing the removed
+// inode/blocks or touching allocation bitmaps. Anything else (in
+// particular any checksum mismatch) is a real bug.
+const ACCEPTED_PATTERNS = [
+  /^e2fsck \d/,
+  /^Pass \d:/,
+  /^Unconnected directory inode/,
+  /^Connect to \/lost\+found\?/,
+  /^'\.\.' in .* should be <The NULL inode>/,
+  /^Fix\?/,
+  /^Unattached inode/,
+  /^Block bitmap differences:/,
+  /^Inode bitmap differences:/,
+  /^Directories count wrong for group/,
+  /^\S+\.img: \*+ WARNING: Filesystem still has errors \*+$/,
+  /^\S+\.img: \d+\/\d+ files/,
+  /^$/,
+];
+
+function assertOnlyAcceptedFsckFindings(output, t) {
+  if (output === null) return;
+  const suspicious = [];
+  for (const line of output.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    if (ACCEPTED_PATTERNS.some((re) => re.test(trimmed))) continue;
+    suspicious.push(trimmed);
+  }
+  if (suspicious.length) t.diagnostic(`Full e2fsck output:\n${output}`);
+  assert.deepEqual(suspicious, [], 'e2fsck reported findings beyond the accepted orphan/bitmap leftovers');
+  assert.ok(!/checksum/i.test(output), 'e2fsck reported a checksum problem — this is a real bug');
+}
+
 test('scanner.js computes the correct removalUnit for a dedicated per-app folder', async () => {
   const u8 = await loadGunzippedImage(fixturePath('test.ext4.img.gz'));
   const part = mutablePartition(u8);
@@ -116,8 +150,5 @@ test('end-to-end: scan -> remove flagged app via its removalUnit -> gone on resc
   assert.ok(rescan.apks.some((a) => a.packageName === 'com.example.plainapp'), 'sibling app unaffected');
 
   const fsckOutput = await runE2fsckOracle(u8);
-  if (fsckOutput !== null) {
-    t.diagnostic(fsckOutput);
-    assert.ok(!/checksum/i.test(fsckOutput), 'e2fsck must not report any checksum problem');
-  }
+  assertOnlyAcceptedFsckFindings(fsckOutput, t);
 });

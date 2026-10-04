@@ -1,8 +1,9 @@
 import { indexSparseOrRaw } from './sparse.js';
 import { VirtualDisk, naturalCompare } from './virtual-disk.js';
 import { readGeometry, readMetadata, partitionSizeBytes, partitionAttrString } from './lp.js';
-import { extractPartition, makePartitionReader } from './extractor.js';
+import { extractPartition, makePartitionReader, makePartitionWriter } from './extractor.js';
 import { scanAllPartitions } from './scanner.js';
+import { PatchSet, streamPatchedDisk } from './patchset.js';
 import {
   supportsDirectoryPicker,
   supportsSaveFilePicker,
@@ -47,6 +48,8 @@ const state = {
   meta: null,
   dirHandle: null,
   cancelRequested: false,
+  patchSet: null, // PatchSet accumulating removal edits against the loaded disk
+  lastScanReport: null, // most recent scanAllPartitions() result (live volume refs + removalUnits)
 };
 
 // ---------- 1. file selection ----------
@@ -125,12 +128,15 @@ parseBtn.addEventListener('click', async () => {
 
     state.disk = disk;
     state.geo = geo;
+    state.patchSet = new PatchSet();
+    state.lastScanReport = null;
 
     await loadSlot(0);
 
     $('metaCard').classList.remove('hidden');
     $('extractCard').classList.remove('hidden');
     $('scanCard').classList.remove('hidden');
+    $('removeCard').classList.add('hidden');
     parseStatus.textContent = 'Done.';
   } catch (err) {
     console.error(err);
@@ -331,7 +337,7 @@ async function makeSink(filename) {
   return fallbackDownloadSink(filename);
 }
 
-function addProgressRow(name) {
+function addProgressRow(name, container = progressList) {
   const row = document.createElement('div');
   row.className = 'progress-row';
   row.innerHTML = `
@@ -339,7 +345,7 @@ function addProgressRow(name) {
     <div class="progress-track"><div class="progress-fill"></div></div>
     <div class="size" style="text-align:right;">0%</div>
   `;
-  progressList.appendChild(row);
+  container.appendChild(row);
   return {
     setProgress(frac) {
       row.querySelector('.progress-fill').style.width = `${Math.min(100, frac * 100).toFixed(1)}%`;
@@ -424,9 +430,18 @@ function deviceAdminPill(status) {
   return `<span class="pill admin-${status}">${label}</span>`;
 }
 
+function pluginPill(flagged) {
+  return flagged ? '<span class="pill plugin-yes">security-plugin-like name</span>' : '';
+}
+
+function updateRemoveButtonState() {
+  const anyChecked = !!scanResults.querySelector('input.apk-select:checked');
+  $('removeBtn').disabled = !anyChecked;
+}
+
 function renderScanResults(report) {
   scanResults.innerHTML = '';
-  for (const partResult of report) {
+  report.forEach((partResult, partIdx) => {
     const heading = document.createElement('div');
     heading.className = 'scan-partition-heading';
     heading.textContent = `${partResult.partitionName} (${partResult.fsType})`;
@@ -444,34 +459,48 @@ function renderScanResults(report) {
       empty.className = 'scan-empty';
       empty.textContent = (partResult.warnings || []).length ? '' : 'No .apk files found.';
       if (empty.textContent) scanResults.appendChild(empty);
-      continue;
+      return;
     }
 
     const table = document.createElement('table');
     table.innerHTML = `
       <thead>
-        <tr><th>Path</th><th>Package</th><th>App label</th><th>Size</th><th>Device admin</th><th>Notes</th></tr>
+        <tr><th style="width:26px;"></th><th>Path</th><th>Package</th><th>App label</th><th>Size</th><th>Flags</th><th>Notes</th></tr>
       </thead>
       <tbody></tbody>
     `;
     const tbody = table.querySelector('tbody');
-    for (const apk of partResult.apks) {
+    partResult.apks.forEach((apk, apkIdx) => {
       const tr = document.createElement('tr');
       const notes = [];
       if (apk.deviceAdminReceivers?.length) notes.push(`receiver: ${apk.deviceAdminReceivers.join(', ')}`);
       if (apk.note) notes.push(apk.note);
+      const removable = !!(partResult.volume && apk.removalUnit);
+      const preChecked = removable && (apk.deviceAdmin === 'yes' || apk.looksLikeSecurityPlugin === true);
+      const checkboxCell = removable
+        ? `<input type="checkbox" class="apk-select" data-part-idx="${partIdx}" data-apk-idx="${apkIdx}" ${preChecked ? 'checked' : ''} />`
+        : '';
       tr.innerHTML = `
+        <td>${checkboxCell}</td>
         <td class="name">${escapeHtml(apk.path)}</td>
         <td class="mono">${escapeHtml(apk.packageName ?? '—')}</td>
         <td>${escapeHtml(apk.appLabel ?? '—')}</td>
         <td class="size">${formatBytes(apk.sizeBytes)}</td>
-        <td>${deviceAdminPill(apk.deviceAdmin ?? 'unknown')}</td>
+        <td>${deviceAdminPill(apk.deviceAdmin ?? 'unknown')} ${pluginPill(apk.looksLikeSecurityPlugin)}</td>
         <td class="attrs">${escapeHtml(notes.join('; '))}</td>
       `;
       tbody.appendChild(tr);
-    }
+    });
     scanResults.appendChild(table);
-  }
+  });
+
+  scanResults.querySelectorAll('input.apk-select').forEach((cb) => {
+    cb.addEventListener('change', updateRemoveButtonState);
+  });
+  const removeCard = $('removeCard');
+  const anyRemovable = report.some((r) => r.volume && r.apks.some((a) => a.removalUnit));
+  removeCard.classList.toggle('hidden', !anyRemovable);
+  updateRemoveButtonState();
 }
 
 scanBtn.addEventListener('click', async () => {
@@ -486,10 +515,14 @@ scanBtn.addEventListener('click', async () => {
   scanStatus.textContent = `Scanning ${names.length} partition(s)…`;
   log(`Starting security scan of ${names.length} partition(s): ${names.join(', ')}`);
 
-  const { disk, meta } = state;
+  const { disk, meta, patchSet } = state;
   const partitions = names.map((name) => {
     const partition = meta.partitions.find((p) => p.name === name);
-    return { name, readRange: makePartitionReader(disk, meta, partition) };
+    return {
+      name,
+      readRange: makePartitionReader(disk, meta, partition, patchSet),
+      writeRange: makePartitionWriter(disk, meta, partition, patchSet),
+    };
   });
 
   try {
@@ -510,16 +543,106 @@ scanBtn.addEventListener('click', async () => {
         }
       }
     });
+    state.lastScanReport = report;
     renderScanResults(report);
     const totalApks = report.reduce((a, r) => a + r.apks.length, 0);
     const totalAdmin = report.reduce((a, r) => a + r.apks.filter((x) => x.deviceAdmin === 'yes').length, 0);
-    scanStatus.textContent = `Done: ${totalApks} APK(s) scanned across ${names.length} partition(s), ${totalAdmin} device-admin-capable.`;
-    log(`Scan complete: ${totalApks} APK(s) scanned, ${totalAdmin} device-admin-capable.`, totalAdmin ? 'warn' : 'ok');
+    const totalPlugin = report.reduce((a, r) => a + r.apks.filter((x) => x.looksLikeSecurityPlugin).length, 0);
+    scanStatus.textContent =
+      `Done: ${totalApks} APK(s) scanned across ${names.length} partition(s), ` +
+      `${totalAdmin} device-admin-capable, ${totalPlugin} security-plugin-like name(s).`;
+    log(
+      `Scan complete: ${totalApks} APK(s) scanned, ${totalAdmin} device-admin-capable, ${totalPlugin} security-plugin-like.`,
+      totalAdmin || totalPlugin ? 'warn' : 'ok'
+    );
   } catch (err) {
     console.error(err);
     scanStatus.textContent = 'Scan failed — see log.';
     log(`ERROR during scan: ${err.message}`, 'err');
   } finally {
+    scanBtn.disabled = false;
+  }
+});
+
+// ---------- 5. remove flagged apps & build a patched super.img ----------
+const removeBtn = $('removeBtn');
+const removeStatus = $('removeStatus');
+const removeProgress = $('removeProgress');
+
+removeBtn.addEventListener('click', async () => {
+  const report = state.lastScanReport;
+  if (!report) return;
+
+  const checked = Array.from(scanResults.querySelectorAll('input.apk-select:checked'));
+  if (!checked.length) {
+    removeStatus.textContent = 'Nothing selected.';
+    return;
+  }
+
+  removeBtn.disabled = true;
+  scanBtn.disabled = true;
+  removeProgress.innerHTML = '';
+  removeStatus.textContent = `Removing ${checked.length} selected app(s)…`;
+  log(`Starting removal of ${checked.length} selected app(s)…`);
+
+  const seen = new Set();
+  let removedOk = 0;
+  let removedFail = 0;
+
+  for (const cb of checked) {
+    const partIdx = Number(cb.dataset.partIdx);
+    const apkIdx = Number(cb.dataset.apkIdx);
+    const partResult = report[partIdx];
+    const apk = partResult?.apks?.[apkIdx];
+    if (!partResult?.volume || !apk?.removalUnit) continue;
+
+    const { kind, parentInode, entryName, parentPath } = apk.removalUnit;
+    const dedupeKey = `${partIdx}|${parentPath}|${entryName}`;
+    if (seen.has(dedupeKey)) continue; // two apks sharing the same folder removalUnit
+    seen.add(dedupeKey);
+
+    const label = `${partResult.partitionName}:${parentPath}/${entryName}`;
+    try {
+      const removed = await partResult.volume.removeDirEntry(parentInode, entryName);
+      if (removed) {
+        log(`  ✓ removed ${kind} "${label}" (${apk.packageName ?? apk.path})`, 'ok');
+        removedOk++;
+      } else {
+        log(`  — "${label}" was already gone (no-op).`, 'warn');
+      }
+    } catch (err) {
+      console.error(err);
+      log(`  ✗ failed to remove "${label}": ${err.message}`, 'err');
+      removedFail++;
+    }
+  }
+
+  removeStatus.textContent = `Removed ${removedOk} item(s) (${removedFail} failed). Building patched super.img…`;
+  log(`Removal pass complete: ${removedOk} succeeded, ${removedFail} failed, ${state.patchSet.count} byte-range patch(es) recorded.`);
+
+  try {
+    const ui = addProgressRow('super_patched.img', removeProgress);
+    const sink = await makeSink('super_patched.img');
+    const { disk, patchSet } = state;
+    let written = 0;
+    for await (const chunk of streamPatchedDisk(disk, patchSet)) {
+      await sink.write(chunk);
+      written += chunk.length;
+      ui.setProgress(written / disk.totalSize);
+    }
+    await sink.close();
+    ui.setDone();
+    removeStatus.textContent =
+      `Done. Downloaded super_patched.img (${formatBytes(disk.totalSize)}). ` +
+      `Flash it with fastboot (e.g. "fastboot flash super super_patched.img") — see the warnings above section 5 ` +
+      `about AVB/dm-verity before you do.`;
+    log('Patched super.img build complete.', 'ok');
+  } catch (err) {
+    console.error(err);
+    removeStatus.textContent = 'Failed to build/save patched image — see log.';
+    log(`ERROR building patched image: ${err.message}`, 'err');
+  } finally {
+    removeBtn.disabled = false;
     scanBtn.disabled = false;
   }
 });
