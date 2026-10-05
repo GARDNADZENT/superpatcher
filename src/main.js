@@ -13,6 +13,7 @@ import {
   DeviceLockRemovalError,
 } from './device-lock-removal.js';
 import { createSha256Stream, toHex } from './sha256.js';
+import { planPartitionEdits, streamEditedSuperImage, PartitionEditError } from './partition-editor.js';
 // Note: src/stream-download.js (an automatic, no-folder-picker streaming
 // download via a service worker) is kept in the repo and fully tested, but
 // deliberately NOT used here as a silent default anymore -- in practice it
@@ -67,6 +68,9 @@ const state = {
   cancelRequested: false,
   patchSet: null, // PatchSet accumulating removal edits against the loaded disk
   lastScanReport: null, // most recent scanAllPartitions() result (live volume refs + removalUnits)
+  editOps: new Map(), // partition name -> resolved {action:'delete'} | {action:'replace', disk, fsType, sizeBytes, fileName}
+  addOps: [], // [{name, groupName, disk, fsType, sizeBytes, fileName}]
+  editRowsPendingValidation: new Set(), // partition names currently showing "replace" with no valid file yet (blocks build)
 };
 
 // ---------- 1. file selection ----------
@@ -179,6 +183,7 @@ parseBtn.addEventListener('click', async () => {
       );
       renderMeta();
       initBrowseCard(built.meta);
+      initEditCard(built.meta);
 
       $('metaCard').classList.remove('hidden');
       $('extractCard').classList.remove('hidden');
@@ -201,6 +206,7 @@ parseBtn.addEventListener('click', async () => {
 
     await loadSlot(0);
     initBrowseCard(state.meta);
+    initEditCard(state.meta);
 
     $('metaCard').classList.remove('hidden');
     $('extractCard').classList.remove('hidden');
@@ -305,7 +311,306 @@ function selectedPartitionNames() {
     .map((tr) => tr.dataset.name);
 }
 
-// ---------- 3. output target ----------
+// ---------- 3. Edit & merge partitions ----------
+const editTable = $('editTable');
+const editSummary = $('editSummary');
+const editStatus = $('editStatus');
+const buildEditedBtn = $('buildEditedBtn');
+const editProgress = $('editProgress');
+const editDownloads = $('editDownloads');
+const addPartitionToggle = $('addPartitionToggle');
+const addPartitionForm = $('addPartitionForm');
+const addPartitionName = $('addPartitionName');
+const addPartitionGroup = $('addPartitionGroup');
+const addPartitionFile = $('addPartitionFile');
+const addPartitionCancel = $('addPartitionCancel');
+
+/** Reads just enough of an uploaded File (sparse or raw) to confirm it's a
+ * real ext4/EROFS filesystem image before accepting it as a replacement/new
+ * partition's content -- catches an accidentally-wrong file immediately
+ * rather than silently baking it into a rebuilt super.img. */
+async function validateReplacementFile(file) {
+  const index = await indexSparseOrRaw(file);
+  const disk = new VirtualDisk([{ file, index }]);
+  const fsType = await detectRawFilesystemType(disk);
+  if (!fsType) {
+    throw new Error(`doesn't look like a valid ext4 or EROFS filesystem image (no superblock found at offset 1024)`);
+  }
+  return { disk, fsType, sizeBytes: disk.totalSize };
+}
+
+function initEditCard(meta) {
+  $('editCard').classList.remove('hidden');
+  state.editOps = new Map();
+  state.addOps = [];
+  state.editRowsPendingValidation = new Set();
+  editDownloads.innerHTML = '';
+  editStatus.textContent = '';
+  addPartitionForm.classList.add('hidden');
+  addPartitionName.value = '';
+  addPartitionFile.value = '';
+
+  addPartitionGroup.innerHTML = '';
+  for (const g of meta.groups) {
+    const opt = document.createElement('option');
+    opt.value = g.name;
+    opt.textContent = g.name;
+    addPartitionGroup.appendChild(opt);
+  }
+
+  editTable.innerHTML = '';
+  for (const p of meta.partitions) {
+    const size = partitionSizeBytes(meta, p);
+    const groupName = meta.groups[p.group_index]?.name ?? '—';
+    const tr = document.createElement('tr');
+    tr.dataset.name = p.name;
+    tr.innerHTML = `
+      <td class="name">${escapeHtml(p.name)}</td>
+      <td class="attrs">${escapeHtml(groupName)}</td>
+      <td class="size">${formatBytes(size)}</td>
+      <td>
+        <select class="edit-action">
+          <option value="keep">Keep</option>
+          <option value="delete">Delete</option>
+          <option value="replace">Replace…</option>
+        </select>
+      </td>
+      <td><input type="file" class="edit-replace-file" style="display:none;" /><span class="edit-replace-status muted"></span></td>
+    `;
+    editTable.appendChild(tr);
+
+    const actionSelect = tr.querySelector('.edit-action');
+    const fileInput = tr.querySelector('.edit-replace-file');
+    const statusSpan = tr.querySelector('.edit-replace-status');
+
+    actionSelect.addEventListener('change', () => {
+      state.editOps.delete(p.name);
+      state.editRowsPendingValidation.delete(p.name);
+      statusSpan.textContent = '';
+      statusSpan.className = 'edit-replace-status muted';
+      if (actionSelect.value === 'delete') {
+        state.editOps.set(p.name, { action: 'delete' });
+        fileInput.style.display = 'none';
+        fileInput.value = '';
+      } else if (actionSelect.value === 'replace') {
+        fileInput.style.display = '';
+        state.editRowsPendingValidation.add(p.name); // no file chosen yet
+      } else {
+        fileInput.style.display = 'none';
+        fileInput.value = '';
+      }
+      refreshEditSummary();
+    });
+
+    fileInput.addEventListener('change', async () => {
+      const file = fileInput.files?.[0];
+      if (!file) return;
+      statusSpan.textContent = 'Checking…';
+      statusSpan.className = 'edit-replace-status muted';
+      try {
+        const { disk, fsType, sizeBytes } = await validateReplacementFile(file);
+        state.editOps.set(p.name, { action: 'replace', disk, fsType, sizeBytes, fileName: file.name });
+        state.editRowsPendingValidation.delete(p.name);
+        statusSpan.textContent = `✓ ${file.name} (${fsType}, ${formatBytes(sizeBytes)})`;
+        statusSpan.className = 'edit-replace-status';
+        statusSpan.style.color = 'var(--good)';
+        log(`"${p.name}" will be replaced with "${file.name}" (${fsType}, ${formatBytes(sizeBytes)}).`);
+      } catch (err) {
+        state.editOps.delete(p.name);
+        state.editRowsPendingValidation.add(p.name);
+        statusSpan.textContent = `✗ ${file.name} ${err.message}`;
+        statusSpan.className = 'edit-replace-status';
+        statusSpan.style.color = 'var(--bad)';
+        log(`Replacement file for "${p.name}" rejected: ${err.message}`, 'err');
+      }
+      refreshEditSummary();
+    });
+  }
+
+  refreshEditSummary();
+}
+
+addPartitionToggle.addEventListener('click', () => {
+  addPartitionForm.classList.remove('hidden');
+  addPartitionToggle.disabled = true;
+});
+addPartitionCancel.addEventListener('click', () => {
+  addPartitionForm.classList.add('hidden');
+  addPartitionToggle.disabled = false;
+  addPartitionName.value = '';
+  addPartitionFile.value = '';
+});
+addPartitionFile.addEventListener('change', async () => {
+  const file = addPartitionFile.files?.[0];
+  const name = addPartitionName.value.trim();
+  if (!file) return;
+  if (!name) {
+    log('Enter a partition name before choosing a file to add.', 'warn');
+    addPartitionFile.value = '';
+    return;
+  }
+  if (state.meta.partitions.some((p) => p.name === name) || state.addOps.some((a) => a.name === name)) {
+    log(`Cannot add "${name}": that name is already in use.`, 'err');
+    addPartitionFile.value = '';
+    return;
+  }
+  try {
+    const { disk, fsType, sizeBytes } = await validateReplacementFile(file);
+    state.addOps.push({ name, groupName: addPartitionGroup.value, disk, fsType, sizeBytes, fileName: file.name });
+    log(`Queued new partition "${name}" (group "${addPartitionGroup.value}") from "${file.name}" (${fsType}, ${formatBytes(sizeBytes)}).`, 'ok');
+    addPartitionForm.classList.add('hidden');
+    addPartitionToggle.disabled = false;
+    addPartitionName.value = '';
+    addPartitionFile.value = '';
+    refreshEditSummary();
+  } catch (err) {
+    log(`File for new partition "${name}" rejected: ${err.message}`, 'err');
+    addPartitionFile.value = '';
+  }
+});
+
+function removeAddOp(name) {
+  state.addOps = state.addOps.filter((a) => a.name !== name);
+  refreshEditSummary();
+}
+
+function refreshEditSummary() {
+  const edits = [];
+  for (const [name, op] of state.editOps) {
+    if (op.action === 'delete') edits.push({ action: 'delete', name });
+    else edits.push({ action: 'replace', name, sizeBytes: op.sizeBytes });
+  }
+  for (const add of state.addOps) {
+    edits.push({ action: 'add', name: add.name, groupName: add.groupName, sizeBytes: add.sizeBytes });
+  }
+
+  const lines = [];
+  for (const [name, op] of state.editOps) {
+    lines.push(op.action === 'delete' ? `✗ delete "${name}"` : `↻ replace "${name}" with "${op.fileName}" (${formatBytes(op.sizeBytes)})`);
+  }
+  for (const add of state.addOps) {
+    lines.push(
+      `+ add "${add.name}" (group "${add.groupName}") from "${add.fileName}" (${formatBytes(add.sizeBytes)}) ` +
+        `<a href="#" class="remove-add-op" data-name="${escapeHtml(add.name)}">remove</a>`
+    );
+  }
+  for (const name of state.editRowsPendingValidation) {
+    lines.push(`⚠ "${name}" is set to Replace but has no valid file chosen yet`);
+  }
+
+  if (!lines.length) {
+    editSummary.innerHTML = 'No changes queued yet.';
+    buildEditedBtn.disabled = true;
+    return;
+  }
+
+  let sizeInfo = '';
+  let hasBlockingError = state.editRowsPendingValidation.size > 0;
+  if (!hasBlockingError && edits.length) {
+    try {
+      const plan = planPartitionEdits(state.meta, state.geo, edits);
+      sizeInfo =
+        `\n\nOriginal total size: ${formatBytes(plan.originalTotalSize)}\n` +
+        `Projected new size: ${formatBytes(plan.newTotalSize)}` +
+        (plan.grew
+          ? ` (grew by ${formatBytes(plan.newTotalSize - plan.originalTotalSize)} — may no longer fit a device's ` +
+            `fixed-size physical super partition; fine for sideloading/testing, verify before flashing back)`
+          : ' (unchanged — fits in the original image size)');
+    } catch (err) {
+      sizeInfo = `\n\n✗ ${err.message}`;
+      hasBlockingError = true;
+    }
+  }
+
+  editSummary.innerHTML = lines.join('<br>') + escapeHtml(sizeInfo).replace(/\n/g, '<br>');
+  editSummary.querySelectorAll('.remove-add-op').forEach((a) => {
+    a.addEventListener('click', (e) => {
+      e.preventDefault();
+      removeAddOp(a.dataset.name);
+    });
+  });
+  buildEditedBtn.disabled = hasBlockingError || edits.length === 0;
+}
+
+buildEditedBtn.addEventListener('click', async () => {
+  const { disk, geo, meta } = state;
+  const edits = [];
+  for (const [name, op] of state.editOps) {
+    if (op.action === 'delete') edits.push({ action: 'delete', name });
+    else edits.push({ action: 'replace', name, sizeBytes: op.sizeBytes });
+  }
+  for (const add of state.addOps) {
+    edits.push({ action: 'add', name: add.name, groupName: add.groupName, sizeBytes: add.sizeBytes });
+  }
+
+  buildEditedBtn.disabled = true;
+  editProgress.innerHTML = '';
+  editDownloads.innerHTML = '';
+  editStatus.textContent = 'Planning…';
+  log(`Starting "Build modified super.img" with ${edits.length} queued change(s)…`);
+
+  try {
+    const plan = planPartitionEdits(meta, geo, edits);
+    log(
+      `Plan: original ${formatBytes(plan.originalTotalSize)} -> new ${formatBytes(plan.newTotalSize)}` +
+        (plan.grew ? ' (grew)' : ' (unchanged size)'),
+      plan.grew ? 'warn' : 'ok'
+    );
+    for (const d of plan.deletedNames) log(`  deleting "${d}"`);
+    for (const a of plan.allocations) log(`  ${a.action === 'replace' ? 'replacing' : 'adding'} "${a.name}": ${formatBytes(a.sizeBytes)} -> allocated ${formatBytes(a.byteLength)}`);
+
+    const sources = new Map();
+    for (const [name, op] of state.editOps) {
+      if (op.action === 'replace') sources.set(name, (offset, length) => op.disk.read(offset, length));
+    }
+    for (const add of state.addOps) {
+      sources.set(add.name, (offset, length) => add.disk.read(offset, length));
+    }
+
+    editStatus.textContent = 'Building modified super.img…';
+    log(
+      state.dirHandle
+        ? `Streaming super_MODIFIED.img straight into the chosen folder "${state.dirHandle.name}"…`
+        : "Building super_MODIFIED.img in memory — a download link will appear below when it's ready…"
+    );
+    const ui = addProgressRow('super_MODIFIED.img', editProgress);
+    const sink = await makeSink('super_MODIFIED.img', plan.newTotalSize, editDownloads);
+    let written = 0;
+    let lastLoggedPct = -1;
+    for await (const chunk of streamEditedSuperImage(disk, geo, plan, sources)) {
+      await sink.write(chunk);
+      written += chunk.length;
+      const frac = written / plan.newTotalSize;
+      ui.setProgress(frac);
+      const pct = Math.floor((frac * 100) / 25) * 25;
+      if (pct > lastLoggedPct && pct < 100) {
+        lastLoggedPct = pct;
+        log(`  super_MODIFIED.img: ${pct}% (${formatBytes(written)} / ${formatBytes(plan.newTotalSize)})`);
+      }
+    }
+    log(`  super_MODIFIED.img: 100% (${formatBytes(written)}) — finalizing…`);
+    await sink.close();
+    ui.setDone();
+
+    editStatus.textContent = state.dirHandle
+      ? `Done. Saved super_MODIFIED.img (${formatBytes(plan.newTotalSize)}) to "${state.dirHandle.name}".`
+      : `Done. super_MODIFIED.img (${formatBytes(plan.newTotalSize)}) is ready — click the download link below.`;
+    log('Modified super.img build complete. Original super.img left untouched.', 'ok');
+  } catch (err) {
+    console.error(err);
+    if (err instanceof PartitionEditError) {
+      editStatus.textContent = `Could not build: ${err.message}`;
+      log(`Edit plan rejected: ${err.message}`, 'err');
+    } else {
+      editStatus.textContent = 'Failed to build modified image — see log.';
+      log(`ERROR building modified image: ${err.message}`, 'err');
+    }
+  } finally {
+    buildEditedBtn.disabled = false;
+  }
+});
+
+// ---------- 4. output target ----------
 const inIframe = (() => {
   try {
     return window.self !== window.top;
@@ -378,7 +683,7 @@ $('chooseDirBtn').addEventListener('click', async () => {
   }
 });
 
-// ---------- 4. extraction ----------
+// ---------- 5. extraction ----------
 const extractBtn = $('extractBtn');
 const cancelBtn = $('cancelBtn');
 const progressList = $('progressList');
@@ -584,7 +889,7 @@ cancelBtn.addEventListener('click', () => {
   $('extractStatus').textContent = 'Cancelling…';
 });
 
-// ---------- 4. browse files ----------
+// ---------- browse files (HTML section 5) ----------
 const browseCard = $('browseCard');
 const browsePartitionSelect = $('browsePartitionSelect');
 const browseStatus = $('browseStatus');
@@ -771,7 +1076,7 @@ async function renderBrowseDir() {
   }
 }
 
-// ---------- 5. security scan (read-only: finds Device Administrator APKs) ----------
+// ---------- 6. security scan (read-only: finds Device Administrator APKs) ----------
 const scanBtn = $('scanBtn');
 const scanStatus = $('scanStatus');
 const scanResults = $('scanResults');
@@ -1005,7 +1310,7 @@ scanBtn.addEventListener('click', async () => {
   }
 });
 
-// ---------- 6. remove flagged apps & build a patched super.img ----------
+// ---------- 7. remove flagged apps & build a patched super.img ----------
 const removeBtn = $('removeBtn');
 const removeStatus = $('removeStatus');
 const removeProgress = $('removeProgress');
@@ -1088,10 +1393,10 @@ removeBtn.addEventListener('click', async () => {
     ui.setDone();
     removeStatus.textContent = state.dirHandle
       ? `Done. Saved super_patched.img (${formatBytes(disk.totalSize)}) to "${state.dirHandle.name}". ` +
-        `Flash it with fastboot (e.g. "fastboot flash super super_patched.img") — see the warnings above section 6 ` +
+        `Flash it with fastboot (e.g. "fastboot flash super super_patched.img") — see the warnings above section 7 ` +
         `about AVB/dm-verity before you do.`
       : `Done. super_patched.img (${formatBytes(disk.totalSize)}) is ready — click the download link below. ` +
-        `Flash it with fastboot (e.g. "fastboot flash super super_patched.img") — see the warnings above section 6 ` +
+        `Flash it with fastboot (e.g. "fastboot flash super super_patched.img") — see the warnings above section 7 ` +
         `about AVB/dm-verity before you do.`;
     log('Patched super.img build complete.', 'ok');
   } catch (err) {
@@ -1104,7 +1409,7 @@ removeBtn.addEventListener('click', async () => {
   }
 });
 
-// ---------- 7. Remove Device Lock Components (fixed, hardcoded targets) ----------
+// ---------- 8. Remove Device Lock Components (fixed, hardcoded targets) ----------
 const deviceLockBtn = $('deviceLockBtn');
 const deviceLockStatus = $('deviceLockStatus');
 const deviceLockResult = $('deviceLockResult');

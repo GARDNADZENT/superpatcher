@@ -302,8 +302,42 @@
       </table>
     </section>
 
+    <section class="card hidden" id="editCard">
+      <h2>3. Edit &amp; merge partitions</h2>
+      <p class="muted" style="margin-top:-6px;">
+        Delete partitions you don't want, or replace one with your own custom-built image (e.g. swap in your own
+        <code>system</code>), then build a new <code>super.img</code> with those changes. Untouched partitions are
+        preserved byte-for-byte; deleted/replaced partitions' old space is simply abandoned (never reused), and
+        replacement content is appended in new space — so the output may be <strong>larger</strong> than the
+        original if your replacement doesn't fit in the space freed up. The original <code>super.img</code> is
+        never modified or overwritten.
+      </p>
+      <table>
+        <thead>
+          <tr><th>Partition</th><th>Group</th><th>Current size</th><th>Action</th><th>Replacement file</th></tr>
+        </thead>
+        <tbody id="editTable"></tbody>
+      </table>
+      <div class="row" style="margin-top:14px;">
+        <button id="addPartitionToggle" class="secondary">+ Add a new partition</button>
+      </div>
+      <div id="addPartitionForm" class="row hidden" style="margin-top:10px;">
+        <input type="text" id="addPartitionName" placeholder="partition name" style="padding:6px 8px; border-radius:6px; border:1px solid var(--border); background:var(--panel-2); color:var(--text);" />
+        <select id="addPartitionGroup"></select>
+        <input type="file" id="addPartitionFile" />
+        <button id="addPartitionCancel" class="secondary">Cancel</button>
+      </div>
+      <div id="editSummary" class="mono" style="margin-top:14px; font-size:12.5px; color:var(--muted);"></div>
+      <div class="row" style="margin-top:10px;">
+        <button id="buildEditedBtn" disabled>Build modified super.img</button>
+        <span class="muted" id="editStatus"></span>
+      </div>
+      <div id="editProgress" style="margin-top:16px;"></div>
+      <div id="editDownloads"></div>
+    </section>
+
     <section class="card hidden" id="extractCard">
-      <h2>3. Extract <span class="muted" style="text-transform:none; letter-spacing:normal; font-weight:400;">(saves automatically — no folder needed)</span></h2>
+      <h2>4. Extract <span class="muted" style="text-transform:none; letter-spacing:normal; font-weight:400;">(saves automatically — no folder needed)</span></h2>
       <div class="row">
         <button id="chooseDirBtn" class="secondary">Choose a specific output folder… (optional)</button>
         <span class="muted" id="dirStatus">No folder chosen — files will stream straight into your Downloads automatically.</span>
@@ -317,7 +351,7 @@
     </section>
 
     <section class="card hidden" id="browseCard">
-      <h2>4. Browse files</h2>
+      <h2>5. Browse files</h2>
       <p class="muted" style="margin-top:-6px;">
         Open a partition's filesystem (ext4 or EROFS, auto-detected) and navigate its directory tree directly —
         see exactly what's inside without extracting the whole partition first, and download individual files
@@ -340,12 +374,12 @@
     </section>
 
     <section class="card hidden" id="scanCard">
-      <h2>5. Security scan — find Device Administrator &amp; security-plugin APKs</h2>
+      <h2>6. Security scan — find Device Administrator &amp; security-plugin APKs</h2>
       <p class="muted" style="margin-top:-6px;">
         Scans the selected partitions' <strong>file systems directly</strong> (ext4 or EROFS, auto-detected) for
         <code>.apk</code> files, checks each app's manifest for Device Administrator capability, and flags names
         that look like security/MDM plugins (a separate, looser heuristic). The scan itself never modifies
-        anything; removal (section 6 below) is a distinct, explicit step.
+        anything; removal (section 7 below) is a distinct, explicit step.
       </p>
       <div class="row">
         <button id="scanBtn">Scan selected partitions</button>
@@ -367,7 +401,7 @@
     </section>
 
     <section class="card hidden" id="removeCard">
-      <h2>6. Remove flagged apps &amp; build a patched super.img</h2>
+      <h2>7. Remove flagged apps &amp; build a patched super.img</h2>
       <div class="callout">
         <strong>Read before using this.</strong> This tool can delete the selected apps' files from the loaded
         partition images and produce a new, patched <code>super.img</code> you can flash with
@@ -397,7 +431,7 @@
     </section>
 
     <section class="card hidden" id="deviceLockCard">
-      <h2>7. Remove Device Lock Components <span class="badge warn">fixed targets</span></h2>
+      <h2>8. Remove Device Lock Components <span class="badge warn">fixed targets</span></h2>
       <div class="callout">
         <strong>What this does.</strong> This action removes exactly three hardcoded files, by their exact path —
         regardless of what the scan above reports (the scanner can't read some compressed EROFS APKs' contents,

@@ -126,10 +126,10 @@ export async function readGeometry(disk) {
   return geo;
 }
 
-function primaryMetadataOffset(geo, slot) {
+export function primaryMetadataOffset(geo, slot) {
   return LP_PARTITION_RESERVED_BYTES + LP_METADATA_GEOMETRY_SIZE * 2 + geo.metadata_max_size * slot;
 }
-function backupMetadataOffset(geo, slot) {
+export function backupMetadataOffset(geo, slot) {
   const start =
     LP_PARTITION_RESERVED_BYTES +
     LP_METADATA_GEOMETRY_SIZE * 2 +

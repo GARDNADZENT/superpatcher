@@ -62,6 +62,15 @@ images don't need to fit in RAM or ever touch a server.
   breadcrumbs, folder-by-folder navigation, file type/size per entry — and
   download any individual file on its own, without having to extract the
   whole partition first just to see what's inside it or pull out one file.
+- **Edit & merge partitions**: delete partitions you don't want, replace one
+  with your own custom-built image (e.g. swap in your own `system`), or add
+  a brand new partition — then build a new `super.img` reflecting those
+  changes. Unlike every other removal feature in this app, this one *does*
+  relay out the dynamic-partition table (recomputing extents/sizes), since
+  a replacement image is essentially never exactly the same size as the
+  original. See
+  [Edit & merge partitions](#edit--merge-partitions) below for exactly how
+  that relayout works and what it does and doesn't guarantee.
 - **Security scan: find Device Administrator-capable & security-plugin-like
   APKs.** Reads directly from a selected partition's filesystem (ext4 or
   EROFS, auto-detected from the superblock — no extraction-to-disk required
@@ -120,6 +129,18 @@ src/
 │                    streamable "unsparsed" virtual disk
 ├── lp.js            liblp metadata format: geometry, header, partition/
 │                    extent/group/block-device tables, checksum verification
+├── lp-writer.js       The write-side counterpart of lp.js: encodes a
+│                    partition/extent/group/block-device table set back
+│                    into the exact on-disk header+tables byte layout
+│                    lp.js reads -- used by partition-editor.js to rebuild
+│                    metadata after a delete/replace/add edit
+├── partition-editor.js "Edit & merge partitions": plans a delete/replace/add
+│                    edit against an already-parsed super.img (validating
+│                    group capacity and metadata-slot-size limits up front)
+│                    and streams the rebuilt image -- geometry untouched,
+│                    every untouched/abandoned byte copied verbatim, only
+│                    the metadata slots and newly-allocated partition
+│                    content actually change
 ├── raw-image.js      Fallback for standalone raw partition images (no LP
 │                    header at all, e.g. a GSI system.img): detects the
 │                    ext4/EROFS filesystem directly and synthesizes a
@@ -430,6 +451,77 @@ A ready-made fixture that contains all three targets (built with real
 the same layout the scanner can't read) lives at
 `sample-data/super_devicelock_demo.img`; rebuild it anytime with
 `node test/build-devicelock-demo-super.mjs`.
+
+## Edit & merge partitions
+
+Every other removal feature in this app follows the same deliberate rule:
+**never resize anything, only patch bytes that are already allocated.**
+This feature is the one exception, because its entire point is swapping in
+a *different* image — your own custom-built `system`, say — which is
+essentially never exactly the same size as what it's replacing. Supporting
+that means the dynamic-partition table itself has to be recomputed
+(extents, sizes), not just patched in place.
+
+**Workflow:**
+
+1. After parsing a `super.img`, section 3 lists every partition with a
+   per-row action: **Keep**, **Delete**, or **Replace…** (which reveals a
+   file picker). A separate "+ Add a new partition" form lets you introduce
+   a brand new partition name under any existing group.
+2. Any file you pick for a replacement or a new partition is validated
+   immediately — sniffed for a real ext4 or EROFS superblock at byte offset
+   1024, exactly like the rest of this app's filesystem detection. A file
+   that doesn't look like a real filesystem image is rejected with a clear
+   reason right there in its row, and the "Build" button stays disabled
+   until it's fixed; nothing you upload is trusted blindly. Sparse (`.img`
+   built with `img2simg`) or raw replacement files both work, since they go
+   through the same sparse-or-raw decoder as the main super.img.
+3. Clicking "Build modified super.img" does the following, entirely
+   client-side:
+   - **Deleting** a partition removes it from the partition table; its old
+     extent space is **abandoned, never reused** — the same
+     "never free blocks" policy this project uses everywhere else.
+   - **Replacing** a partition keeps its name/attributes/group, but its old
+     extent(s) are abandoned exactly like a delete, and its *new* content is
+     allocated fresh space, sector-aligned, appended after the end of
+     everything the original image could reference.
+   - **Adding** a partition works the same way — new content, newly
+     allocated space, under whichever existing group you chose for it (new
+     groups can't be created by this feature).
+   - Every **untouched** partition's bytes and extents are left completely
+     alone — not just unmodified content, but literally the exact same
+     on-disk byte offsets as before.
+   - LP **geometry is never touched** (`metadata_max_size`/
+     `metadata_slot_count`/`logical_block_size` all stay byte-for-byte
+     identical); only the per-slot metadata header+tables are regenerated
+     (via the new `lp-writer.js`, the write-side counterpart of `lp.js`),
+     written into every existing metadata slot (primary and backup alike).
+     **Groups are preserved as-is** (name/flags/`maximum_size`); if a
+     group declares a nonzero `maximum_size` cap, the planner checks the
+     new layout still fits under it and refuses to build (with the exact
+     numbers) rather than silently exceeding it.
+4. Because space is only ever appended, never reclaimed, **the output can
+   be larger than the original** — exactly how much is shown live in the
+   edit summary before you even click Build (original size vs. projected
+   new size). This is intentional: a bigger output is clearly surfaced, not
+   silently produced, and the summary explains the flashing implication (a
+   real device's physical `super` partition is a fixed size, so a grown
+   image may no longer fit back onto the same device, even though it's a
+   perfectly valid, flashable-via-fastboot-to-a-big-enough-target image).
+5. The result is delivered through the same download-link flow as every
+   other build in this app (or streamed straight to a pre-chosen folder) —
+   see "Saving" above. **The original `super.img` is never modified.**
+
+**What this feature does not do** (by design, not by oversight):
+- It never creates new groups — only existing ones can be targeted for a
+  new/replacement partition.
+- It never inspects *why* a group's capacity might matter beyond the
+  numeric `maximum_size` check above (e.g. it doesn't know about A/B slot
+  conventions beyond what's literally encoded in the metadata).
+- It never touches AVB/dm-verity/vbmeta, same caveat as every other
+  build feature here — a partition whose content changed will need
+  verification handled separately before the result can boot verified.
+- It never flashes anything.
 
 ## Known limitations
 
