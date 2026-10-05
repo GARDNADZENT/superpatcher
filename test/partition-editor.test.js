@@ -274,3 +274,55 @@ test('planPartitionEdits(): rejects zero-byte replacement/add content', async ()
     PartitionEditError
   );
 });
+
+test('streamEditedSuperImage(): tags a read failure from the ORIGINAL image with a clear sourceLabel', async () => {
+  const image = await buildBaseImage();
+  const { disk, geo, meta } = await loadDisk(image);
+  const plan = planPartitionEdits(meta, geo, [{ action: 'delete', name: 'vendor' }]);
+
+  const originalRead = disk.read.bind(disk);
+  let calls = 0;
+  disk.read = async (...args) => {
+    calls++;
+    if (calls === 1) {
+      const err = new Error('The requested file could not be read, typically due to permission problems...');
+      err.name = 'NotReadableError';
+      err.fileName = 'super.img';
+      throw err;
+    }
+    return originalRead(...args);
+  };
+
+  await assert.rejects(
+    () => buildAndRead(disk, geo, plan, new Map()),
+    (err) => {
+      assert.equal(err.sourceLabel, 'the original super.img');
+      assert.equal(err.fileName, 'super.img');
+      return true;
+    }
+  );
+});
+
+test('streamEditedSuperImage(): tags a read failure from a REPLACEMENT source with the partition name', async () => {
+  const image = await buildBaseImage();
+  const { disk, geo, meta } = await loadDisk(image);
+  const newContent = deterministicBytes(5000, 99);
+  const plan = planPartitionEdits(meta, geo, [{ action: 'replace', name: 'system', sizeBytes: newContent.length }]);
+
+  const failingSource = async () => {
+    const err = new Error('The requested file could not be read, typically due to permission problems...');
+    err.name = 'NotReadableError';
+    err.fileName = 'my-custom-system.img';
+    throw err;
+  };
+  const sources = new Map([['system', failingSource]]);
+
+  await assert.rejects(
+    () => buildAndRead(disk, geo, plan, sources),
+    (err) => {
+      assert.equal(err.sourceLabel, 'the replacement/new content for "system"');
+      assert.equal(err.fileName, 'my-custom-system.img');
+      return true;
+    }
+  );
+});

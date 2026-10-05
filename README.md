@@ -71,20 +71,27 @@ images don't need to fit in RAM or ever touch a server.
   original. See
   [Edit & merge partitions](#edit--merge-partitions) below for exactly how
   that relayout works and what it does and doesn't guarantee.
-- **Resilient to transient file-read hiccups on very large images.** Every
-  raw byte read from a loaded File/Blob (`src/file-read-retry.js`) retries
-  patiently (10 attempts, exponential backoff capped at 20s — up to ~2
-  minutes of cumulative patience per read) on the specific browser
-  `NotReadableError` ("the requested file could not be read, typically due
-  to permission problems...") that can surface partway through a long
-  (many-minutes) multi-gigabyte read — commonly antivirus real-time
-  scanning, a OneDrive/Dropbox "Files On-Demand" placeholder needing to
-  re-download, or the system sleeping mid-build — instead of failing the
-  entire build over what's usually a temporary condition. Each retry is
-  logged in the UI so a pause is explained rather than silent; if every
-  retry is exhausted, the error is replaced with a longer, actionable
-  explanation of likely causes and what to try (your queued edits/selection
-  are preserved, so you can just try the same build again).
+- **Handles the browser's `NotReadableError` on very large loaded files as
+  well as it realistically can.** Every raw byte read from a loaded
+  File/Blob (`src/file-read-retry.js`) retries briefly (a handful of
+  attempts, short exponential backoff) on the specific `NotReadableError`
+  ("the requested file could not be read, typically due to permission
+  problems...") that can surface during a long multi-gigabyte read.
+  Per the File API spec this error covers two different situations that
+  look identical in JS: a genuinely transient concurrent lock (e.g.
+  antivirus briefly scanning the file), which a short retry can ride out,
+  and the File's underlying snapshot having gone *permanently* stale for
+  the rest of the page's lifetime (a well-documented real-world issue,
+  especially for files above a couple of GB) — which no amount of retrying
+  the same File object can ever fix. Retries are deliberately brief rather
+  than extremely patient, since blindly retrying for minutes doesn't help
+  the second case and this app works with exactly the large files where
+  that case is common. If every retry is exhausted, the error is replaced
+  with a specific, actionable explanation naming exactly which loaded file
+  failed to read and why reloading the page and re-selecting the file(s)
+  fresh (right before building, not long before) is the real fix for a
+  stale reference — plus the usual other suspects (cloud-sync placeholder
+  files, antivirus, system sleep) worth ruling out too.
 - **Security scan: find Device Administrator-capable & security-plugin-like
   APKs.** Reads directly from a selected partition's filesystem (ext4 or
   EROFS, auto-detected from the superblock — no extraction-to-disk required

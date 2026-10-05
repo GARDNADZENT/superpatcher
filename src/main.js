@@ -59,7 +59,12 @@ function logReadRetry(attempt, err) {
  * text. Returns true if it did so. */
 function logTransientReadAdviceIfApplicable(err) {
   if (!isLikelyTransientReadError(err)) return false;
-  log('This build failed because your browser could not read a loaded file, even after retrying for a while:', 'err');
+  const what = err.sourceLabel
+    ? `${err.sourceLabel}${err.fileName ? ` ("${err.fileName}")` : ''}`
+    : err.fileName
+      ? `"${err.fileName}"`
+      : 'a loaded file';
+  log(`This build failed because your browser could not read ${what}, even after retrying briefly:`, 'err');
   for (const line of TRANSIENT_READ_FAILURE_ADVICE.split('\n')) {
     if (line.trim()) log(line, 'warn');
   }
@@ -623,7 +628,7 @@ buildEditedBtn.addEventListener('click', async () => {
       editStatus.textContent = `Could not build: ${err.message}`;
       log(`Edit plan rejected: ${err.message}`, 'err');
     } else if (logTransientReadAdviceIfApplicable(err)) {
-      editStatus.textContent = 'A file could not be read (see the log for likely causes and what to try) — your queued changes are still here, you can click Build again.';
+      editStatus.textContent = 'A file could not be read — see the log for what this usually means and how to fix it. Your queued changes are still here.';
     } else {
       editStatus.textContent = 'Failed to build modified image — see log.';
       log(`ERROR building modified image: ${err.message}`, 'err');
@@ -1427,7 +1432,7 @@ removeBtn.addEventListener('click', async () => {
   } catch (err) {
     console.error(err);
     if (logTransientReadAdviceIfApplicable(err)) {
-      removeStatus.textContent = 'A file could not be read (see the log for likely causes and what to try) — click "Remove selected" again once addressed.';
+      removeStatus.textContent = 'A file could not be read — see the log for what this usually means and how to fix it.';
     } else {
       removeStatus.textContent = 'Failed to build/save patched image — see log.';
       log(`ERROR building patched image: ${err.message}`, 'err');
@@ -1615,7 +1620,7 @@ deviceLockBtn.addEventListener('click', async () => {
       deviceLockStatus.textContent = 'Stopped — see details below.';
       log(`STOP: ${err.message}`, 'err');
     } else if (logTransientReadAdviceIfApplicable(err)) {
-      deviceLockResult.textContent = 'A file could not be read (see the log for likely causes and what to try). Try again once addressed.';
+      deviceLockResult.textContent = 'A file could not be read — see the log for what this usually means and how to fix it.';
       deviceLockStatus.textContent = 'Failed — see log.';
     } else {
       console.error(err);

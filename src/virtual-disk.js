@@ -17,10 +17,14 @@ export class VirtualDisk {
    *   when a raw file read transiently fails and is about to be retried
    *   (see file-read-retry.js) -- e.g. to surface a log line in the UI
    *   during a long multi-gigabyte build instead of just pausing silently.
+   * @param {object} [opts.retryOptions] passed straight through to
+   *   readFileRangeWithRetry() (retries/baseDelayMs/maxDelayMs) -- mainly
+   *   useful for tests that want to avoid waiting out real backoff delays.
    */
   constructor(parts, opts = {}) {
     this.files = parts.map((p) => p.file);
     this.onReadRetry = opts.onReadRetry;
+    this.retryOptions = opts.retryOptions;
     this.chunks = [];
     let base = 0;
     parts.forEach((part, fileIndex) => {
@@ -75,7 +79,17 @@ export class VirtualDisk {
     if (c.type === 'raw') {
       const file = this.files[c.fileIndex];
       const start = c.fileOffset + relOffset;
-      return readFileRangeWithRetry(file, start, length, { onRetry: this.onReadRetry });
+      try {
+        return await readFileRangeWithRetry(file, start, length, { onRetry: this.onReadRetry, ...this.retryOptions });
+      } catch (err) {
+        // Tag which underlying File this came from, so a caller several
+        // layers up (e.g. main.js's build handlers) can tell the user
+        // exactly which of possibly several loaded files to re-select,
+        // rather than a generic "a file could not be read".
+        if (err.fileIndex === undefined) err.fileIndex = c.fileIndex;
+        if (err.fileName === undefined) err.fileName = file?.name;
+        throw err;
+      }
     }
     if (c.type === 'fill') {
       const out = new Uint8Array(length);

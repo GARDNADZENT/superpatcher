@@ -283,8 +283,13 @@ export async function* streamEditedSuperImage(disk, geo, plan, sources, pieceSiz
 
   // The original file, exactly as long as it always was, with only the
   // metadata slots patched.
-  for await (const chunk of streamPatchedDisk(disk, patchSet, pieceSize)) {
-    yield chunk;
+  try {
+    for await (const chunk of streamPatchedDisk(disk, patchSet, pieceSize)) {
+      yield chunk;
+    }
+  } catch (err) {
+    if (err.sourceLabel === undefined) err.sourceLabel = 'the original super.img';
+    throw err;
   }
 
   // Then every newly-allocated partition's content, in allocation order,
@@ -293,10 +298,15 @@ export async function* streamEditedSuperImage(disk, geo, plan, sources, pieceSiz
     const readSource = sources.get(alloc.name);
     if (!readSource) throw new PartitionEditError(`No content source provided for "${alloc.name}".`, { alloc });
     let written = 0;
-    while (written < alloc.sizeBytes) {
-      const take = Math.min(pieceSize, alloc.sizeBytes - written);
-      yield await readSource(written, take);
-      written += take;
+    try {
+      while (written < alloc.sizeBytes) {
+        const take = Math.min(pieceSize, alloc.sizeBytes - written);
+        yield await readSource(written, take);
+        written += take;
+      }
+    } catch (err) {
+      if (err.sourceLabel === undefined) err.sourceLabel = `the replacement/new content for "${alloc.name}"`;
+      throw err;
     }
     const padding = alloc.byteLength - alloc.sizeBytes;
     if (padding > 0) {
