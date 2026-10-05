@@ -1,6 +1,7 @@
 import { indexSparseOrRaw } from './sparse.js';
 import { VirtualDisk, naturalCompare } from './virtual-disk.js';
 import { readGeometry, readMetadata, partitionSizeBytes, partitionAttrString, findOverlappingExtents } from './lp.js';
+import { detectRawFilesystemType, buildSyntheticRawImageMetadata, guessRawImagePartitionName } from './raw-image.js';
 import { extractPartition, makePartitionReader, makePartitionWriter } from './extractor.js';
 import { scanAllPartitions, detectAndOpenFilesystem } from './scanner.js';
 import { PatchSet, streamPatchedDisk } from './patchset.js';
@@ -135,7 +136,57 @@ parseBtn.addEventListener('click', async () => {
     log(`Combined virtual disk size: ${formatBytes(disk.totalSize)}`);
 
     parseStatus.textContent = 'Reading LP geometry & metadata…';
-    const geo = await readGeometry(disk);
+    let geo;
+    try {
+      geo = await readGeometry(disk);
+    } catch (geometryErr) {
+      // Not every .img a user has is a dynamic-partition super.img — a GSI
+      // (Generic System Image) or any other standalone partition image
+      // (system.img/vendor.img/product.img pulled individually) is just a
+      // single ext4/EROFS filesystem starting at byte 0, with no LP header
+      // at all. Rather than dead-ending on a technically-correct-but-
+      // unhelpful "no LP geometry" error, detect that case and synthesize
+      // a single-partition metadata set covering the whole file, so every
+      // other feature (extraction, scan, removal) keeps working unchanged.
+      const rawFsType = await detectRawFilesystemType(disk);
+      if (!rawFsType) throw geometryErr;
+
+      const partitionName = guessRawImagePartitionName(state.files[state.files.length - 1]?.name || 'raw_image');
+      const built = buildSyntheticRawImageMetadata(disk, rawFsType, partitionName);
+      geo = built.geo;
+      log(
+        `No LP ("super.img") geometry block found — this looks like a standalone, single-partition ` +
+          `${rawFsType.toUpperCase()} image instead (e.g. a GSI system.img), not a dynamic-partition super.img. ` +
+          `Treating the whole file as one partition named "${partitionName}" so you can still inspect/extract it.`,
+        'warn'
+      );
+      if (built.truncatedBytes > 0) {
+        log(
+          `Note: the last ${built.truncatedBytes} byte(s) of the file aren't a full 512-byte sector and are ` +
+            `excluded from the partition range (this is normal padding, not data loss).`,
+          'warn'
+        );
+      }
+      state.disk = disk;
+      state.geo = geo;
+      state.patchSet = new PatchSet();
+      state.lastScanReport = null;
+      state.meta = built.meta;
+      log(
+        `Synthetic single-partition metadata built: 1 partition ("${partitionName}", ` +
+          `${formatBytes(partitionSizeBytes(built.meta, built.meta.partitions[0]))}).`,
+        'ok'
+      );
+      renderMeta();
+
+      $('metaCard').classList.remove('hidden');
+      $('extractCard').classList.remove('hidden');
+      $('scanCard').classList.remove('hidden');
+      $('removeCard').classList.add('hidden');
+      $('deviceLockCard').classList.add('hidden'); // fixed-path targets never apply to a single raw partition
+      parseStatus.textContent = 'Done (loaded as a single raw partition image).';
+      return;
+    }
     log(
       `Geometry OK (${geo.source}${geo.checksumValid ? '' : ', checksum MISMATCH — proceeding anyway'}): ` +
         `${geo.metadata_slot_count} slot(s), metadata_max_size=${geo.metadata_max_size}, logical_block_size=${geo.logical_block_size}`,

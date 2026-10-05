@@ -17,6 +17,18 @@ images don't need to fit in RAM or ever touch a server.
 - **LP (liblp) metadata parsing**: geometry block, primary/backup metadata
   header + partition/extent/group/block-device tables, with SHA-256
   checksum verification and automatic primary→backup fallback.
+- **Also loads standalone raw partition images directly** (most commonly a
+  GSI — Generic System Image — but equally a lone `vendor.img`/`product.img`
+  pulled individually): these have no LP header at all (they're just one
+  ext4/EROFS filesystem starting at byte 0), so rather than failing with
+  "not a super.img", the app detects the filesystem directly and treats the
+  whole file as one synthetic partition, named by sniffing the filename
+  (`system`/`vendor`/`product`/`system_ext`, falling back to the bare
+  filename). Every other feature — the partition table, extraction, the
+  security scan, "remove flagged apps" — works on it exactly the same way
+  as a real super.img partition; only "Remove Device Lock Components" is
+  hidden for this case, since its three fixed target paths assume a real
+  multi-partition dynamic image. See `src/raw-image.js`.
 - Lists every logical partition with its size and attributes
   (readonly / slot-suffixed / updated / disabled), with checkboxes to pick
   which ones to extract.
@@ -103,6 +115,12 @@ src/
 │                    streamable "unsparsed" virtual disk
 ├── lp.js            liblp metadata format: geometry, header, partition/
 │                    extent/group/block-device tables, checksum verification
+├── raw-image.js      Fallback for standalone raw partition images (no LP
+│                    header at all, e.g. a GSI system.img): detects the
+│                    ext4/EROFS filesystem directly and synthesizes a
+│                    single-partition geo/meta pair in the exact shape
+│                    lp.js normally produces, so every other feature works
+│                    on it unmodified
 ├── extractor.js      Resolves a partition's extents and streams its bytes;
 │                    also exposes makePartitionReader()/makePartitionWriter()
 │                    for random-access reads/writes straight off a
