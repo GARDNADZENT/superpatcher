@@ -45,6 +45,13 @@ function log(msg, cls) {
   logEl.scrollTop = logEl.scrollHeight;
 }
 
+/** Shared VirtualDisk onReadRetry handler: surfaces a transient-file-read
+ * retry (see file-read-retry.js) in the log instead of just pausing
+ * silently for a few seconds during a long multi-gigabyte operation. */
+function logReadRetry(attempt, err) {
+  log(`  (transient file read hiccup, retry ${attempt}: ${err.message || err}) — retrying…`, 'warn');
+}
+
 function formatBytes(n) {
   const num = typeof n === 'bigint' ? Number(n) : n;
   if (!Number.isFinite(num)) return String(n);
@@ -136,7 +143,7 @@ parseBtn.addEventListener('click', async () => {
       parts.push({ file, index });
     }
 
-    const disk = new VirtualDisk(parts);
+    const disk = new VirtualDisk(parts, { onReadRetry: logReadRetry });
     log(`Combined virtual disk size: ${formatBytes(disk.totalSize)}`);
 
     parseStatus.textContent = 'Reading LP geometry & metadata…';
@@ -331,7 +338,7 @@ const addPartitionCancel = $('addPartitionCancel');
  * rather than silently baking it into a rebuilt super.img. */
 async function validateReplacementFile(file) {
   const index = await indexSparseOrRaw(file);
-  const disk = new VirtualDisk([{ file, index }]);
+  const disk = new VirtualDisk([{ file, index }], { onReadRetry: logReadRetry });
   const fsType = await detectRawFilesystemType(disk);
   if (!fsType) {
     throw new Error(`doesn't look like a valid ext4 or EROFS filesystem image (no superblock found at offset 1024)`);

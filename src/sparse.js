@@ -8,6 +8,8 @@
 // output stream. The actual bytes are only read on demand, in bounded
 // windows, by virtual-disk.js.
 
+import { readFileRangeWithRetry } from './file-read-retry.js';
+
 export const SPARSE_HEADER_MAGIC = 0xed26ff3a;
 
 const CHUNK_TYPE_RAW = 0xcac1;
@@ -16,14 +18,15 @@ const CHUNK_TYPE_DONT_CARE = 0xcac3;
 const CHUNK_TYPE_CRC32 = 0xcac4;
 
 /**
- * Read an exact byte range from a File/Blob as a Uint8Array.
+ * Read an exact byte range from a File/Blob as a Uint8Array. Retries a
+ * bounded number of times on the transient browser read failure described
+ * in file-read-retry.js.
  * @param {Blob} file
  * @param {number} offset
  * @param {number} length
  */
 async function readFileRange(file, offset, length) {
-  const buf = await file.slice(offset, offset + length).arrayBuffer();
-  return new Uint8Array(buf);
+  return readFileRangeWithRetry(file, offset, length);
 }
 
 /**

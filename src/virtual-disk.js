@@ -5,15 +5,22 @@
 // This is what makes it possible to handle multi-gigabyte images in a
 // browser tab: reads are served directly from the underlying File objects
 // (via Blob.slice()) or synthesized on the fly for fill/zero regions.
+import { readFileRangeWithRetry } from './file-read-retry.js';
 
 export class VirtualDisk {
   /**
    * @param {Array<{file: Blob, index: {outputSize:number, chunks:Array}}>} parts
    *   Ordered list of source files (e.g. super.img, super_1.img, ...), each
    *   with its sparse-chunk index. Parts are concatenated in array order.
+   * @param {object} [opts]
+   * @param {(attempt:number, err:Error) => void} [opts.onReadRetry] called
+   *   when a raw file read transiently fails and is about to be retried
+   *   (see file-read-retry.js) -- e.g. to surface a log line in the UI
+   *   during a long multi-gigabyte build instead of just pausing silently.
    */
-  constructor(parts) {
+  constructor(parts, opts = {}) {
     this.files = parts.map((p) => p.file);
+    this.onReadRetry = opts.onReadRetry;
     this.chunks = [];
     let base = 0;
     parts.forEach((part, fileIndex) => {
@@ -68,8 +75,7 @@ export class VirtualDisk {
     if (c.type === 'raw') {
       const file = this.files[c.fileIndex];
       const start = c.fileOffset + relOffset;
-      const buf = await file.slice(start, start + length).arrayBuffer();
-      return new Uint8Array(buf);
+      return readFileRangeWithRetry(file, start, length, { onRetry: this.onReadRetry });
     }
     if (c.type === 'fill') {
       const out = new Uint8Array(length);

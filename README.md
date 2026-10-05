@@ -71,6 +71,14 @@ images don't need to fit in RAM or ever touch a server.
   original. See
   [Edit & merge partitions](#edit--merge-partitions) below for exactly how
   that relayout works and what it does and doesn't guarantee.
+- **Resilient to transient file-read hiccups on very large images.** Every
+  raw byte read from a loaded File/Blob (`src/file-read-retry.js`) retries
+  with backoff on the specific browser `NotReadableError`
+  ("the requested file could not be read, typically due to permission
+  problems...") that can surface partway through a long (many-minutes)
+  multi-gigabyte read — commonly antivirus/indexing software briefly
+  touching the file — instead of failing the entire build. Logged in the UI
+  when it happens so a brief pause is visible rather than silent.
 - **Security scan: find Device Administrator-capable & security-plugin-like
   APKs.** Reads directly from a selected partition's filesystem (ext4 or
   EROFS, auto-detected from the superblock — no extraction-to-disk required
