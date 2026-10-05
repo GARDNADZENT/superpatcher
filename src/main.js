@@ -14,6 +14,7 @@ import {
 } from './device-lock-removal.js';
 import { createSha256Stream, toHex } from './sha256.js';
 import { planPartitionEdits, streamEditedSuperImage, PartitionEditError } from './partition-editor.js';
+import { encodeSparseStream, wrapSourceForRealPassOnly } from './sparse-encode.js';
 import { isLikelyTransientReadError, TRANSIENT_READ_FAILURE_ADVICE } from './file-read-retry.js';
 // Note: src/stream-download.js (an automatic, no-folder-picker streaming
 // download via a service worker) is kept in the repo and fully tested, but
@@ -122,6 +123,80 @@ async function closeSinkWithFeedback(sink, label) {
     done = true;
     if (interval) clearInterval(interval);
   }
+}
+
+/**
+ * Writes a raw byte stream (`makeRawStream()`, covering exactly
+ * `totalBytes`) to `sink`, optionally re-encoding it as a real Android
+ * sparse image first (what `fastboot flash` expects) via
+ * encodeSparseStream() -- logging progress either way, and invoking
+ * `onChunk` (if given) on every RAW chunk before it's written/encoded, so
+ * callers that need to hash the logical content (e.g. for a modification
+ * report) still see every byte exactly once regardless of output format.
+ * Returns the actual number of bytes written to the sink (in sparse mode
+ * this is typically much less than totalBytes).
+ */
+async function writeStreamToSink(makeRawStream, totalBytes, sink, { label, sparse, blockSize, onChunk, onUiProgress }) {
+  let written = 0;
+
+  if (!sparse) {
+    let lastLoggedPct = -1;
+    for await (const chunk of makeRawStream()) {
+      onChunk && onChunk(chunk);
+      await sink.write(chunk);
+      written += chunk.length;
+      onUiProgress && onUiProgress(written, totalBytes);
+      const frac = totalBytes > 0 ? written / totalBytes : 1;
+      const pct = Math.floor((frac * 100) / 25) * 25;
+      if (pct > lastLoggedPct && pct < 100) {
+        lastLoggedPct = pct;
+        log(`  ${label}: ${pct}% (${formatBytes(written)} / ${formatBytes(totalBytes)})`);
+      }
+    }
+    log(`  ${label}: 100% (${formatBytes(written)}) — finalizing…`);
+    return written;
+  }
+
+  if (totalBytes % blockSize !== 0) {
+    throw new Error(
+      `Cannot produce a sparse image: the rebuilt size (${totalBytes} bytes) is not an exact multiple of the ` +
+        `block size (${blockSize} bytes). Try unchecking "Output as Android sparse image" and converting ` +
+        `separately with img2simg instead.`
+    );
+  }
+  log(`  ${label}: building as a sparse image (two passes: scan, then write) — this takes longer than raw…`);
+  let lastScanPct = -1;
+  let lastWritePct = -1;
+  // onChunk must see the RAW content exactly once -- hooked into the real
+  // "writing" pass only, never the "scanning" pass (which re-reads the
+  // identical bytes purely to classify them -- see wrapSourceForRealPassOnly's
+  // own doc comment for why this is deliberately NOT done by reacting to
+  // the onProgress callback below, which is a subtly different, buggier
+  // thing to synchronize on).
+  const wrappedSource = onChunk ? wrapSourceForRealPassOnly(makeRawStream, onChunk) : makeRawStream;
+  const sparseStream = encodeSparseStream(wrappedSource, totalBytes, blockSize, 16 * 1024 * 1024, (phase, done, total) => {
+    // One continuous 0-100% bar across both passes (scanning = first half,
+    // writing = second half), rather than two separate 0-100% cycles.
+    const combinedDone = phase === 'scanning' ? done : total + done;
+    onUiProgress && onUiProgress(combinedDone, total * 2);
+    const pct = Math.floor(((done / total) * 100) / 10) * 10;
+    if (phase === 'scanning' && pct > lastScanPct && pct < 100) {
+      lastScanPct = pct;
+      log(`  ${label}: scanning ${pct}% (pass 1/2)…`);
+    }
+    if (phase === 'writing' && pct > lastWritePct && pct < 100) {
+      lastWritePct = pct;
+      log(`  ${label}: writing ${pct}% (pass 2/2)…`);
+    }
+  });
+  for await (const chunk of sparseStream) {
+    await sink.write(chunk);
+    written += chunk.length;
+  }
+  log(
+    `  ${label}: 100% — sparse-encoded to ${formatBytes(written)} (raw equivalent ${formatBytes(totalBytes)}) — finalizing…`
+  );
+  return written;
 }
 
 function formatBytes(n) {
@@ -592,14 +667,20 @@ function refreshEditSummary() {
   let hasBlockingError = state.editRowsPendingValidation.size > 0;
   if (!hasBlockingError && edits.length) {
     try {
-      const plan = planPartitionEdits(state.meta, state.geo, edits);
+      const plan = planPartitionEdits(state.meta, state.geo, edits, { originalDiskSize: state.disk.totalSize });
       sizeInfo =
         `\n\nOriginal total size: ${formatBytes(plan.originalTotalSize)}\n` +
         `Projected new size: ${formatBytes(plan.newTotalSize)}` +
         (plan.grew
           ? ` (grew by ${formatBytes(plan.newTotalSize - plan.originalTotalSize)} — may no longer fit a device's ` +
             `fixed-size physical super partition; fine for sideloading/testing, verify before flashing back)`
-          : ' (unchanged — fits in the original image size)');
+          : plan.freeBytesReclaimed > 0
+            ? ` (unchanged — ${formatBytes(plan.freeBytesReclaimed)} of freed space from deleted/replaced ` +
+              `partitions was reused, so this still fits in the original image size)`
+            : ' (unchanged — fits in the original image size)');
+      if (plan.freeBytesReclaimed > 0) {
+        sizeInfo += `\nReclaimed space reused: ${formatBytes(plan.freeBytesReclaimed)} of ${formatBytes(plan.freeBytesAvailable)} freed`;
+      }
     } catch (err) {
       sizeInfo = `\n\n✗ ${err.message}`;
       hasBlockingError = true;
@@ -634,14 +715,23 @@ buildEditedBtn.addEventListener('click', async () => {
   log(`Starting "Build modified super.img" with ${edits.length} queued change(s)…`);
 
   try {
-    const plan = planPartitionEdits(meta, geo, edits);
+    const plan = planPartitionEdits(meta, geo, edits, { originalDiskSize: disk.totalSize });
     log(
       `Plan: original ${formatBytes(plan.originalTotalSize)} -> new ${formatBytes(plan.newTotalSize)}` +
-        (plan.grew ? ' (grew)' : ' (unchanged size)'),
+        (plan.grew ? ' (grew)' : ' (unchanged size)') +
+        (plan.freeBytesReclaimed > 0 ? `, reused ${formatBytes(plan.freeBytesReclaimed)} of freed space` : ''),
       plan.grew ? 'warn' : 'ok'
     );
     for (const d of plan.deletedNames) log(`  deleting "${d}"`);
-    for (const a of plan.allocations) log(`  ${a.action === 'replace' ? 'replacing' : 'adding'} "${a.name}": ${formatBytes(a.sizeBytes)} -> allocated ${formatBytes(a.byteLength)}`);
+    for (const a of plan.allocations) {
+      const reusedBytes = a.ranges.filter((r) => r.byteOffset < plan.originalBoundary).reduce((sum, r) => sum + r.byteLength, 0);
+      const appendedBytes = a.byteLength - reusedBytes;
+      log(
+        `  ${a.action === 'replace' ? 'replacing' : 'adding'} "${a.name}": ${formatBytes(a.sizeBytes)} -> allocated ` +
+          `${formatBytes(a.byteLength)} across ${a.ranges.length} extent(s)` +
+          (reusedBytes > 0 ? ` (${formatBytes(reusedBytes)} reused` + (appendedBytes > 0 ? ` + ${formatBytes(appendedBytes)} new)` : ')') : ' (all new space)')
+      );
+    }
 
     const sources = new Map();
     for (const [name, op] of state.editOps) {
@@ -660,26 +750,20 @@ buildEditedBtn.addEventListener('click', async () => {
     warnIfLargeFolderWrite(plan.newTotalSize);
     const ui = addProgressRow('super_MODIFIED.img', editProgress);
     const sink = await makeSink('super_MODIFIED.img', plan.newTotalSize, editDownloads);
-    let written = 0;
-    let lastLoggedPct = -1;
-    for await (const chunk of streamEditedSuperImage(disk, geo, plan, sources)) {
-      await sink.write(chunk);
-      written += chunk.length;
-      const frac = written / plan.newTotalSize;
-      ui.setProgress(frac);
-      const pct = Math.floor((frac * 100) / 25) * 25;
-      if (pct > lastLoggedPct && pct < 100) {
-        lastLoggedPct = pct;
-        log(`  super_MODIFIED.img: ${pct}% (${formatBytes(written)} / ${formatBytes(plan.newTotalSize)})`);
-      }
-    }
-    log(`  super_MODIFIED.img: 100% (${formatBytes(written)}) — finalizing…`);
+    const useSparse = $('editSparseOutput').checked;
+    await writeStreamToSink(() => streamEditedSuperImage(disk, geo, plan, sources), plan.newTotalSize, sink, {
+      label: 'super_MODIFIED.img',
+      sparse: useSparse,
+      blockSize: geo.logical_block_size || 4096,
+      onUiProgress: (done, total) => ui.setProgress(total > 0 ? done / total : 1),
+    });
     await closeSinkWithFeedback(sink, 'super_MODIFIED.img');
     ui.setDone();
 
+    const sizeLabel = useSparse ? `sparse image, ${formatBytes(plan.newTotalSize)} raw equivalent` : formatBytes(plan.newTotalSize);
     editStatus.textContent = state.dirHandle
-      ? `Done. Saved super_MODIFIED.img (${formatBytes(plan.newTotalSize)}) to "${state.dirHandle.name}".`
-      : `Done. super_MODIFIED.img (${formatBytes(plan.newTotalSize)}) is ready — click the download link below.`;
+      ? `Done. Saved super_MODIFIED.img (${sizeLabel}) to "${state.dirHandle.name}".`
+      : `Done. super_MODIFIED.img (${sizeLabel}) is ready — click the download link below.`;
     log('Modified super.img build complete. Original super.img left untouched.', 'ok');
   } catch (err) {
     console.error(err);
@@ -1467,28 +1551,22 @@ removeBtn.addEventListener('click', async () => {
     warnIfLargeFolderWrite(state.disk.totalSize);
     const ui = addProgressRow('super_patched.img', removeProgress);
     const sink = await makeSink('super_patched.img', state.disk.totalSize, ui.extraEl);
-    const { disk, patchSet } = state;
-    let written = 0;
-    let lastLoggedPct = -1;
-    for await (const chunk of streamPatchedDisk(disk, patchSet)) {
-      await sink.write(chunk);
-      written += chunk.length;
-      const frac = written / disk.totalSize;
-      ui.setProgress(frac);
-      const pct = Math.floor((frac * 100) / 25) * 25;
-      if (pct > lastLoggedPct && pct < 100) {
-        lastLoggedPct = pct;
-        log(`  super_patched.img: ${pct}% (${formatBytes(written)} / ${formatBytes(disk.totalSize)})`);
-      }
-    }
-    log(`  super_patched.img: 100% (${formatBytes(written)}) — finalizing…`);
+    const { disk, patchSet, geo } = state;
+    const useSparse = $('removeSparseOutput').checked;
+    await writeStreamToSink(() => streamPatchedDisk(disk, patchSet), disk.totalSize, sink, {
+      label: 'super_patched.img',
+      sparse: useSparse,
+      blockSize: geo.logical_block_size || 4096,
+      onUiProgress: (done, total) => ui.setProgress(total > 0 ? done / total : 1),
+    });
     await closeSinkWithFeedback(sink, 'super_patched.img');
     ui.setDone();
+    const patchedSizeLabel = useSparse ? `sparse image, ${formatBytes(disk.totalSize)} raw equivalent` : formatBytes(disk.totalSize);
     removeStatus.textContent = state.dirHandle
-      ? `Done. Saved super_patched.img (${formatBytes(disk.totalSize)}) to "${state.dirHandle.name}". ` +
+      ? `Done. Saved super_patched.img (${patchedSizeLabel}) to "${state.dirHandle.name}". ` +
         `Flash it with fastboot (e.g. "fastboot flash super super_patched.img") — see the warnings above section 7 ` +
         `about AVB/dm-verity before you do.`
-      : `Done. super_patched.img (${formatBytes(disk.totalSize)}) is ready — click the download link below. ` +
+      : `Done. super_patched.img (${patchedSizeLabel}) is ready — click the download link below. ` +
         `Flash it with fastboot (e.g. "fastboot flash super super_patched.img") — see the warnings above section 7 ` +
         `about AVB/dm-verity before you do.`;
     log('Patched super.img build complete.', 'ok');
@@ -1522,7 +1600,7 @@ async function hashWholeDisk(disk, patchSet) {
 }
 
 deviceLockBtn.addEventListener('click', async () => {
-  const { disk, meta } = state;
+  const { disk, meta, geo } = state;
   if (!disk || !meta) return;
 
   deviceLockBtn.disabled = true;
@@ -1578,23 +1656,16 @@ deviceLockBtn.addEventListener('click', async () => {
     warnIfLargeFolderWrite(disk.totalSize);
     const hasher = createSha256Stream();
     const sink = await makeSink('super_MODIFIED.img', disk.totalSize, deviceLockDownloads);
-    let written = 0;
-    let lastLoggedPct = -1;
-    for await (const chunk of streamPatchedDisk(disk, result.patchSet)) {
-      hasher.update(chunk);
-      await sink.write(chunk);
-      written += chunk.length;
-      const frac = written / disk.totalSize;
-      const pct = Math.floor((frac * 100) / 25) * 25;
-      if (pct > lastLoggedPct && pct < 100) {
-        lastLoggedPct = pct;
-        log(`  super_MODIFIED.img: ${pct}% (${formatBytes(written)} / ${formatBytes(disk.totalSize)})`);
-      }
-    }
-    log(`  super_MODIFIED.img: 100% (${formatBytes(written)}) — finalizing…`);
+    const useSparseDeviceLock = $('deviceLockSparseOutput').checked;
+    const deviceLockBytesWritten = await writeStreamToSink(() => streamPatchedDisk(disk, result.patchSet), disk.totalSize, sink, {
+      label: 'super_MODIFIED.img',
+      sparse: useSparseDeviceLock,
+      blockSize: geo.logical_block_size || 4096,
+      onChunk: (chunk) => hasher.update(chunk),
+    });
     await closeSinkWithFeedback(sink, 'super_MODIFIED.img');
     const modifiedSha256 = toHex(hasher.digest());
-    log(`  modified SHA-256: ${modifiedSha256}`, 'ok');
+    log(`  modified SHA-256 (of the logical disk content, regardless of output format): ${modifiedSha256}`, 'ok');
 
     // ---------------- validation (browser-side) ----------------
     deviceLockStatus.textContent = 'Validating…';
@@ -1665,7 +1736,7 @@ deviceLockBtn.addEventListener('click', async () => {
         `BUILD SUCCESSFUL\n\n` +
         `Removed:\n${DEVICE_LOCK_TARGETS.map((t) => `✓ ${t.package}`).join('\n')}\n\n` +
         `Modified partitions:\n${result.partitionsModified.map((n) => `✓ ${n}`).join('\n')}\n\n` +
-        `Output:\nsuper_MODIFIED.img (${formatBytes(written)})\n\n` +
+        `Output:\nsuper_MODIFIED.img (${useSparseDeviceLock ? `sparse, ${formatBytes(deviceLockBytesWritten)}` : formatBytes(deviceLockBytesWritten)})\n\n` +
         `Original:\nUNCHANGED (sha256 ${originalSha256.slice(0, 16)}…)\n\n` +
         `Report:\nmodification-report.json`;
       deviceLockStatus.textContent = 'Done.';

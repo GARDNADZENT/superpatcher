@@ -329,6 +329,10 @@
       </div>
       <div id="editSummary" class="mono" style="margin-top:14px; font-size:12.5px; color:var(--muted);"></div>
       <div class="row" style="margin-top:10px;">
+        <label class="chk"><input type="checkbox" id="editSparseOutput" /> Output as Android sparse image</label>
+        <span class="muted">(what <code>fastboot flash</code> expects; takes a bit longer to build since the data is scanned twice)</span>
+      </div>
+      <div class="row" style="margin-top:10px;">
         <button id="buildEditedBtn" disabled>Build modified super.img</button>
         <span class="muted" id="editStatus"></span>
       </div>
@@ -424,6 +428,10 @@
         back until you build and download the patched file.
       </p>
       <div class="row">
+        <label class="chk"><input type="checkbox" id="removeSparseOutput" /> Output as Android sparse image</label>
+        <span class="muted">(what <code>fastboot flash</code> expects; takes a bit longer since the data is scanned twice)</span>
+      </div>
+      <div class="row" style="margin-top:10px;">
         <button id="removeBtn" disabled>Remove selected &amp; build patched super.img</button>
         <span class="muted" id="removeStatus"></span>
       </div>
@@ -447,6 +455,10 @@
         overwritten. Same AVB/dm-verity/vbmeta caveat as above applies, and this never flashes anything.
       </div>
       <div class="row">
+        <label class="chk"><input type="checkbox" id="deviceLockSparseOutput" /> Output as Android sparse image</label>
+        <span class="muted">(what <code>fastboot flash</code> expects; takes a bit longer since the data is scanned twice)</span>
+      </div>
+      <div class="row" style="margin-top:10px;">
         <button id="deviceLockBtn" disabled>Remove Device Lock Components &amp; build super_MODIFIED.img</button>
         <span class="muted" id="deviceLockStatus"></span>
       </div>

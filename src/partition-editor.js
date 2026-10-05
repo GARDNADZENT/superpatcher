@@ -9,17 +9,22 @@
 //     logical_block_size all stay byte-for-byte identical).
 //   - Groups are preserved as-is (name/flags/maximum_size); only which
 //     partitions/extents belong to them is recomputed.
-//   - Deleting a partition (or replacing one) abandons its old extent(s)
-//     forever -- consistent with this project's established
-//     "never reuse freed space" policy for the app-removal features.
-//     Replacement/new partition content is always allocated in brand-new
-//     space appended after the end of the original block device, which
-//     means the output image can grow but the ORIGINAL bytes for every
-//     unrelated (and even abandoned) byte range are never touched or moved.
-//   - Growing the file means the result may no longer fit the fixed
-//     physical "super" partition size on a real device -- planPartitionEdits()
-//     always reports both the original and new total size so this is
-//     never silent.
+//   - Deleting or replacing a partition frees its old extent(s) for reuse:
+//     new/replacement content is allocated into that freed space first
+//     (first-fit, in ascending offset order, splitting a single
+//     partition's content across multiple extents if needed -- completely
+//     normal for a dynamic-partition table), and only appended as brand
+//     new space (growing the file) once the freed pool is exhausted. This
+//     is what makes it possible to replace a partition with a *different*
+//     size image without the output necessarily growing at all, as long as
+//     enough space was freed elsewhere in the same edit.
+//   - Every byte NOT touched by an edit -- including any leftover
+//     unreclaimed fragment of freed space -- is preserved at its exact
+//     original file offset; nothing is ever shifted around.
+//   - Growing the file (when reuse isn't enough) means the result may no
+//     longer fit the fixed physical "super" partition size on a real
+//     device -- planPartitionEdits() always reports both the original and
+//     new total size so this is never silent.
 import {
   partitionExtentRanges,
   partitionSizeBytes,
@@ -30,7 +35,7 @@ import {
   LP_SECTOR_SIZE,
 } from './lp.js';
 import { encodeLpMetadata } from './lp-writer.js';
-import { PatchSet, streamPatchedDisk } from './patchset.js';
+import { PatchSet, applyPatches } from './patchset.js';
 
 export class PartitionEditError extends Error {
   constructor(message, details) {
@@ -60,8 +65,16 @@ function alignUp(value, align) {
  *   {action:'replace', name:string, sizeBytes:number} |
  *   {action:'add', name:string, groupName:string, attributes?:number, sizeBytes:number}
  * >} edits
+ * @param {object} [opts]
+ * @param {number} [opts.originalDiskSize] the ACTUAL loaded file's total
+ *   byte length (VirtualDisk.totalSize). Used (along with the metadata's
+ *   own declared block device size) to make sure new allocations never
+ *   land on bytes that physically exist in the file but aren't covered by
+ *   the declared block device size -- defaults to the declared size itself
+ *   if not given, which is correct for any image where those two numbers
+ *   already agree (the overwhelmingly common case).
  */
-export function planPartitionEdits(meta, geo, edits) {
+export function planPartitionEdits(meta, geo, edits, opts = {}) {
   const byName = new Map(meta.partitions.map((p) => [p.name, p]));
   const groupIndexByName = new Map(meta.groups.map((g, i) => [g.name, i]));
 
@@ -109,28 +122,48 @@ export function planPartitionEdits(meta, geo, edits) {
   // the geometry's logical_block_size, else a safe default.
   const blockDevice = meta.blockDevices[0];
   const alignment = blockDevice?.alignment || geo.logical_block_size || 4096;
+  const declaredSize = Number(blockDevice?.size ?? 0n);
+  const originalDiskSize = opts.originalDiskSize ?? declaredSize;
 
-  // New allocations always start strictly after everything the ORIGINAL
-  // image could possibly reference or contain -- the declared block device
-  // size, the actual loaded file size, and the end of the furthest-out
-  // existing extent, whichever is largest -- so a new allocation can never
-  // collide with anything, including bytes the metadata doesn't currently
-  // reference but which physically exist in the file.
-  let cursor = Math.max(
-    Number(blockDevice?.size ?? 0n),
-    totalMetadataRegionSize(geo)
-  );
+  // Anything beyond this point in the file is "append-only" territory --
+  // brand new space, never anything a deletion could free up, since
+  // nothing valid can already live out here.
+  let appendCursor = Math.max(declaredSize, originalDiskSize, totalMetadataRegionSize(geo));
   for (const ext of meta.extents) {
     if (ext.target_type === LP_TARGET_TYPE_LINEAR) {
       const end = Number(ext.target_data + ext.num_sectors) * LP_SECTOR_SIZE;
-      if (end > cursor) cursor = end;
+      if (end > appendCursor) appendCursor = end;
     }
   }
-  const originalDataEnd = cursor; // first byte truly free to allocate into
+  const originalBoundary = appendCursor; // everything below this is real, pre-existing file content
+
+  // Free-space pool: every deleted/replaced partition's OLD linear
+  // extent(s), sorted and merged into non-overlapping ranges so adjacent
+  // freed fragments can satisfy a single larger allocation.
+  const freePool = [];
+  for (const p of meta.partitions) {
+    if (!deletes.has(p.name) && !replaces.has(p.name)) continue;
+    for (const r of partitionExtentRanges(meta, p)) {
+      if (r.type === 'linear' && r.targetSource === 0) {
+        freePool.push({ offset: Number(r.byteOffset), length: Number(r.byteLength) });
+      }
+    }
+  }
+  freePool.sort((a, b) => a.offset - b.offset);
+  const mergedFree = [];
+  for (const r of freePool) {
+    const last = mergedFree[mergedFree.length - 1];
+    if (last && r.offset <= last.offset + last.length) {
+      last.length = Math.max(last.length, r.offset + r.length - last.offset);
+    } else {
+      mergedFree.push({ ...r });
+    }
+  }
+  const freeBytesAvailable = mergedFree.reduce((a, r) => a + r.length, 0);
 
   const newPartitions = [];
   const newExtents = [];
-  const allocations = []; // {name, action, byteOffset, byteLength, sizeBytes}
+  const allocations = []; // {name, action, sizeBytes, byteLength, ranges:[{byteOffset,byteLength}]}
 
   function carryOverPartition(p) {
     const ranges = partitionExtentRanges(meta, p);
@@ -156,19 +189,39 @@ export function planPartitionEdits(meta, geo, edits) {
     });
   }
 
+  /** Allocates `sizeBytes` (sector-aligned up) for a replace/add partition:
+   * first-fit from the freed-space pool (possibly across several
+   * fragments, i.e. multiple extents -- completely normal for a dynamic
+   * partition), then whatever doesn't fit is appended as new space. */
   function allocateNew(name, action, groupIndex, attributes, sizeBytes) {
     const byteLength = alignUp(sizeBytes, alignment);
-    const byteOffset = cursor;
-    cursor += byteLength;
+    let remaining = byteLength;
+    const ranges = [];
+    for (const free of mergedFree) {
+      if (remaining <= 0) break;
+      if (free.length <= 0) continue;
+      const take = Math.min(free.length, remaining);
+      ranges.push({ byteOffset: free.offset, byteLength: take });
+      free.offset += take;
+      free.length -= take;
+      remaining -= take;
+    }
+    if (remaining > 0) {
+      ranges.push({ byteOffset: appendCursor, byteLength: remaining });
+      appendCursor += remaining;
+    }
+
     const firstIndex = newExtents.length;
-    newExtents.push({
-      num_sectors: BigInt(byteLength / LP_SECTOR_SIZE),
-      target_type: LP_TARGET_TYPE_LINEAR,
-      target_data: BigInt(byteOffset / LP_SECTOR_SIZE),
-      target_source: 0,
-    });
-    newPartitions.push({ name, attributes, first_extent_index: firstIndex, num_extents: 1, group_index: groupIndex });
-    allocations.push({ name, action, byteOffset, byteLength, sizeBytes });
+    for (const range of ranges) {
+      newExtents.push({
+        num_sectors: BigInt(range.byteLength / LP_SECTOR_SIZE),
+        target_type: LP_TARGET_TYPE_LINEAR,
+        target_data: BigInt(range.byteOffset / LP_SECTOR_SIZE),
+        target_source: 0,
+      });
+    }
+    newPartitions.push({ name, attributes, first_extent_index: firstIndex, num_extents: ranges.length, group_index: groupIndex });
+    allocations.push({ name, action, sizeBytes, byteLength, ranges });
   }
 
   // Preserve original partition order for anything untouched or replaced
@@ -210,8 +263,8 @@ export function planPartitionEdits(meta, geo, edits) {
     );
   }
 
-  const newTotalSize = cursor;
-  const originalTotalSize = Number(blockDevice?.size ?? 0n);
+  const newTotalSize = appendCursor;
+  const originalTotalSize = Math.max(declaredSize, originalDiskSize);
   const newBlockDevices = meta.blockDevices.map((b, i) =>
     i === 0 ? { ...b, size: BigInt(newTotalSize) } : b
   );
@@ -251,17 +304,64 @@ export function planPartitionEdits(meta, geo, edits) {
     originalTotalSize,
     newTotalSize,
     grew: newTotalSize > originalTotalSize,
-    originalDataEnd,
+    originalBoundary,
+    freeBytesReclaimed: freeBytesAvailable - mergedFree.reduce((a, r) => a + r.length, 0),
+    freeBytesAvailable,
   };
 }
 
+/** Builds the full, gap-free, non-overlapping list of segments covering
+ * [0, plan.newTotalSize): each is either `{type:'original', start, end}`
+ * (copy verbatim from the loaded disk, metadata patches still applied) or
+ * `{type:'new', start, end, allocName, srcStart}` (bytes
+ * [srcStart, srcStart + (end-start)) of the named allocation's own content
+ * -- used to let a replacement partition split across several reused
+ * free-space fragments still read its source content in one continuous
+ * sequence, regardless of how fragmented its destination extents are). */
+function buildSegments(plan) {
+  let segments = [{ type: 'original', start: 0, end: plan.originalBoundary }];
+
+  function carve(carveStart, carveLength, data) {
+    const carveEnd = carveStart + carveLength;
+    const result = [];
+    for (const seg of segments) {
+      if (seg.end <= carveStart || seg.start >= carveEnd) {
+        result.push(seg);
+        continue;
+      }
+      if (seg.start < carveStart) result.push({ ...seg, end: carveStart });
+      result.push({ ...data, start: carveStart, end: carveEnd });
+      if (seg.end > carveEnd) result.push({ ...seg, start: carveEnd });
+    }
+    segments = result;
+  }
+
+  for (const alloc of plan.allocations) {
+    let srcCursor = 0;
+    for (const range of alloc.ranges) {
+      const data = { type: 'new', allocName: alloc.name, srcStart: srcCursor };
+      if (range.byteOffset >= plan.originalBoundary) {
+        // Pure append -- guaranteed not to overlap anything already placed.
+        segments.push({ ...data, start: range.byteOffset, end: range.byteOffset + range.byteLength });
+      } else {
+        carve(range.byteOffset, range.byteLength, data);
+      }
+      srcCursor += range.byteLength;
+    }
+  }
+
+  segments.sort((a, b) => a.start - b.start);
+  return segments;
+}
+
 /**
- * Streams the final edited super.img: the entire original file (geometry
- * untouched, every metadata slot replaced with the new table, everything
- * else byte-for-byte original -- including now-abandoned bytes), followed
- * by each newly-allocated partition's content, read from its own
- * `readSource(offset, length)` function and zero-padded up to its
- * sector-aligned allocation.
+ * Streams the final edited super.img as a sequence of segments covering
+ * the whole new file: unchanged original bytes (with only the metadata
+ * slots patched -- geometry itself is never touched) interleaved with
+ * replacement/new partition content wherever it was allocated into reused
+ * freed space, followed by any remaining content that had to be appended
+ * as brand new space. Every byte not explicitly part of an edit keeps its
+ * exact original file offset.
  *
  * @param {import('./virtual-disk.js').VirtualDisk} disk original disk
  * @param {object} geo
@@ -281,41 +381,50 @@ export async function* streamEditedSuperImage(disk, geo, plan, sources, pieceSiz
     patchSet.addPatch(backupMetadataOffset(geo, slot) + header.length, tables);
   }
 
-  // The original file, exactly as long as it always was, with only the
-  // metadata slots patched.
-  try {
-    for await (const chunk of streamPatchedDisk(disk, patchSet, pieceSize)) {
-      yield chunk;
-    }
-  } catch (err) {
-    if (err.sourceLabel === undefined) err.sourceLabel = 'the original super.img';
-    throw err;
-  }
+  const allocBySizeBytes = new Map(plan.allocations.map((a) => [a.name, a.sizeBytes]));
+  const segments = buildSegments(plan);
 
-  // Then every newly-allocated partition's content, in allocation order,
-  // zero-padded to fill its full sector-aligned extent.
-  for (const alloc of plan.allocations) {
-    const readSource = sources.get(alloc.name);
-    if (!readSource) throw new PartitionEditError(`No content source provided for "${alloc.name}".`, { alloc });
-    let written = 0;
-    try {
-      while (written < alloc.sizeBytes) {
-        const take = Math.min(pieceSize, alloc.sizeBytes - written);
-        yield await readSource(written, take);
-        written += take;
+  for (const seg of segments) {
+    let pos = seg.start;
+    while (pos < seg.end) {
+      const take = Math.min(pieceSize, seg.end - pos);
+      if (seg.type === 'original') {
+        try {
+          const base = await disk.read(pos, take);
+          yield applyPatches(base, pos, patchSet.patches);
+        } catch (err) {
+          if (err.sourceLabel === undefined) err.sourceLabel = 'the original super.img';
+          throw err;
+        }
+      } else {
+        const srcOffset = seg.srcStart + (pos - seg.start);
+        const realSize = allocBySizeBytes.get(seg.allocName) ?? 0;
+        if (srcOffset >= realSize) {
+          // Past the real uploaded content -- this is sector-alignment padding.
+          yield new Uint8Array(take);
+        } else if (srcOffset + take <= realSize) {
+          try {
+            yield await sources.get(seg.allocName)(srcOffset, take);
+          } catch (err) {
+            if (err.sourceLabel === undefined) err.sourceLabel = `the replacement/new content for "${seg.allocName}"`;
+            throw err;
+          }
+        } else {
+          // This piece straddles the real-content/padding boundary.
+          const realPart = realSize - srcOffset;
+          let realBytes;
+          try {
+            realBytes = await sources.get(seg.allocName)(srcOffset, realPart);
+          } catch (err) {
+            if (err.sourceLabel === undefined) err.sourceLabel = `the replacement/new content for "${seg.allocName}"`;
+            throw err;
+          }
+          const out = new Uint8Array(take);
+          out.set(realBytes, 0);
+          yield out;
+        }
       }
-    } catch (err) {
-      if (err.sourceLabel === undefined) err.sourceLabel = `the replacement/new content for "${alloc.name}"`;
-      throw err;
-    }
-    const padding = alloc.byteLength - alloc.sizeBytes;
-    if (padding > 0) {
-      let remaining = padding;
-      while (remaining > 0) {
-        const take = Math.min(pieceSize, remaining);
-        yield new Uint8Array(take);
-        remaining -= take;
-      }
+      pos += take;
     }
   }
 }

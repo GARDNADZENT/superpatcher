@@ -326,3 +326,122 @@ test('streamEditedSuperImage(): tags a read failure from a REPLACEMENT source wi
     }
   );
 });
+
+// ---------------- space-reclaiming allocator ----------------
+
+test('planPartitionEdits(): replacing a partition with content that fits in ITS OWN freed space does not grow the file', async () => {
+  const image = await buildBaseImage();
+  const { meta, geo } = await loadDisk(image);
+  // "system" is 20000 bytes; replace with something smaller -- must fit
+  // entirely inside system's own freed extent, no growth needed at all.
+  const plan = planPartitionEdits(meta, geo, [{ action: 'replace', name: 'system', sizeBytes: 10000 }]);
+  assert.equal(plan.grew, false);
+  assert.equal(plan.newTotalSize, plan.originalTotalSize);
+  assert.equal(plan.allocations[0].ranges.length, 1);
+  assert.equal(plan.allocations[0].ranges[0].byteOffset < plan.originalBoundary, true);
+});
+
+test('planPartitionEdits(): deleting a partition frees its space for a DIFFERENT partition\'s replacement', async () => {
+  const image = await buildBaseImage();
+  const { meta, geo } = await loadDisk(image);
+  // Delete "product" (10000 bytes) and grow "vendor" (originally 15000) up
+  // to 20000 bytes -- the extra 5000 bytes needed should come from
+  // product's freed space, not force the file to grow.
+  const plan = planPartitionEdits(meta, geo, [
+    { action: 'delete', name: 'product' },
+    { action: 'replace', name: 'vendor', sizeBytes: 20000 },
+  ]);
+  assert.equal(plan.grew, false, `expected no growth, got ${plan.originalTotalSize} -> ${plan.newTotalSize}`);
+  assert.ok(plan.freeBytesReclaimed > 0);
+});
+
+test('streamEditedSuperImage(): a replacement split across multiple reused free fragments reads back correctly, and surrounding untouched bytes survive', async () => {
+  // A dedicated 4-partition layout where "keep_me" physically sits BETWEEN
+  // "vendor" and "product" (buildSuperImage lays partitions out
+  // sequentially in array order) -- so deleting vendor+product leaves two
+  // genuinely non-adjacent freed fragments, with keep_me's untouched bytes
+  // sandwiched in between them.
+  const image = await buildSuperImage([
+    { name: 'system', bytes: deterministicBytes(20000, 1) },
+    { name: 'vendor', bytes: deterministicBytes(15000, 2) },
+    { name: 'keep_me', bytes: deterministicBytes(8000, 9) },
+    { name: 'product', bytes: deterministicBytes(10000, 3) },
+  ]);
+  const { disk, geo, meta } = await loadDisk(image);
+  const newContent = deterministicBytes(23000, 55); // > either single freed fragment alone
+  const plan = planPartitionEdits(meta, geo, [
+    { action: 'delete', name: 'vendor' },
+    { action: 'delete', name: 'product' },
+    { action: 'add', name: 'merged_new', groupName: 'default', sizeBytes: newContent.length },
+  ]);
+  const newPartAlloc = plan.allocations.find((a) => a.name === 'merged_new');
+  assert.ok(newPartAlloc.ranges.length >= 2, 'expected the new content to span multiple reused fragments');
+  assert.equal(plan.grew, false, 'the two freed fragments together are big enough, so this should not need to grow');
+
+  const sources = new Map([['merged_new', sourceFromBytes(newContent)]]);
+  const rebuilt = await buildAndRead(disk, geo, plan, sources);
+
+  const { disk: newDisk, meta: newMeta } = await loadDisk(rebuilt);
+  const mergedPartition = newMeta.partitions.find((p) => p.name === 'merged_new');
+  const readBack = await makePartitionReader(newDisk, newMeta, mergedPartition)(0, newContent.length);
+  assert.deepEqual(readBack, newContent, 'content spanning multiple reused fragments must read back correctly, in order');
+
+  // The untouched "system" and "keep_me" partitions (which physically
+  // sandwich/separate the two freed fragments) must still be exactly right.
+  const systemBytes = await makePartitionReader(newDisk, newMeta, newMeta.partitions.find((p) => p.name === 'system'))(
+    0,
+    20000
+  );
+  assert.deepEqual(systemBytes, deterministicBytes(20000, 1));
+  const keepMeBytes = await makePartitionReader(newDisk, newMeta, newMeta.partitions.find((p) => p.name === 'keep_me'))(
+    0,
+    8000
+  );
+  assert.deepEqual(keepMeBytes, deterministicBytes(8000, 9));
+  assert.deepEqual(findOverlappingExtents(newMeta), { ok: true });
+});
+
+test('streamEditedSuperImage(): a replacement that partially reuses freed space and partially appends reads back correctly', async () => {
+  const image = await buildBaseImage();
+  const { disk, geo, meta } = await loadDisk(image);
+  // Delete "product" (10000 bytes) and replace "vendor" with something
+  // bigger than (vendor's own 15000) + (product's freed 10000 bytes)
+  // combined -- the remainder must be appended as new space, and the
+  // content must still come back byte-for-byte correct across the
+  // reused+appended boundary.
+  const newContent = deterministicBytes(40000, 77); // > 15000+10000 = 25000 available for reuse
+  const plan = planPartitionEdits(meta, geo, [
+    { action: 'delete', name: 'product' },
+    { action: 'replace', name: 'vendor', sizeBytes: newContent.length },
+  ]);
+  assert.equal(plan.grew, true);
+  const vendorAlloc = plan.allocations.find((a) => a.name === 'vendor');
+  assert.ok(vendorAlloc.ranges.length >= 2, 'expected a mix of reused + appended ranges');
+  const lastRange = vendorAlloc.ranges[vendorAlloc.ranges.length - 1];
+  assert.ok(lastRange.byteOffset >= plan.originalBoundary, 'the overflow portion must be a pure append');
+
+  const sources = new Map([['vendor', sourceFromBytes(newContent)]]);
+  const rebuilt = await buildAndRead(disk, geo, plan, sources);
+  const { disk: newDisk, meta: newMeta } = await loadDisk(rebuilt);
+  const vendorBytes = await makePartitionReader(
+    newDisk,
+    newMeta,
+    newMeta.partitions.find((p) => p.name === 'vendor')
+  )(0, newContent.length);
+  assert.deepEqual(vendorBytes, newContent);
+  assert.deepEqual(findOverlappingExtents(newMeta), { ok: true });
+});
+
+test('planPartitionEdits(): accepts an explicit originalDiskSize that is larger than the declared block device size', async () => {
+  const image = await buildBaseImage();
+  const { meta, geo } = await loadDisk(image);
+  const paddedSize = image.length + 4096; // pretend the real file has trailing padding
+  const plan = planPartitionEdits(meta, geo, [{ action: 'add', name: 'z', groupName: 'default', sizeBytes: 100 }], {
+    originalDiskSize: paddedSize,
+  });
+  // The new allocation must land at/after the padded size, never inside
+  // the "unknown trailing data" region.
+  const alloc = plan.allocations.find((a) => a.name === 'z');
+  assert.ok(alloc.ranges[0].byteOffset >= paddedSize);
+});
+

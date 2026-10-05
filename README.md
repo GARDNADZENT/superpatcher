@@ -68,9 +68,16 @@ images don't need to fit in RAM or ever touch a server.
   changes. Unlike every other removal feature in this app, this one *does*
   relay out the dynamic-partition table (recomputing extents/sizes), since
   a replacement image is essentially never exactly the same size as the
-  original. See
+  original — a space-reclaiming allocator reuses whatever a delete/replace
+  freed up before resorting to appending brand new space, so swapping in a
+  differently-sized image doesn't necessarily grow the output at all. An
+  optional "output as Android sparse image" checkbox produces a real
+  multi-chunk sparse file (what `fastboot flash super` actually expects —
+  a raw image can be rejected outright even at the correct size), usually
+  much smaller than raw too. See
   [Edit & merge partitions](#edit--merge-partitions) below for exactly how
-  that relayout works and what it does and doesn't guarantee.
+  the relayout/reuse and sparse encoding work and what they do and don't
+  guarantee.
 - **Handles the browser's `NotReadableError` on very large loaded files as
   well as it realistically can.** Every raw byte read from a loaded
   File/Blob (`src/file-read-retry.js`) retries briefly (a handful of
@@ -174,12 +181,22 @@ src/
 │                    lp.js reads -- used by partition-editor.js to rebuild
 │                    metadata after a delete/replace/add edit
 ├── partition-editor.js "Edit & merge partitions": plans a delete/replace/add
-│                    edit against an already-parsed super.img (validating
-│                    group capacity and metadata-slot-size limits up front)
-│                    and streams the rebuilt image -- geometry untouched,
-│                    every untouched/abandoned byte copied verbatim, only
-│                    the metadata slots and newly-allocated partition
-│                    content actually change
+│                    edit against an already-parsed super.img (space-
+│                    reclaiming first-fit allocator reusing freed extents
+│                    before appending new space, validating group capacity
+│                    and metadata-slot-size limits up front) and streams
+│                    the rebuilt image -- geometry untouched, every
+│                    untouched/abandoned byte copied verbatim, only the
+│                    metadata slots and newly-allocated partition content
+│                    actually change
+├── sparse-encode.js   Streaming Android sparse-image encoder (the write-side
+│                    counterpart of sparse.js's decoder) -- classifies the
+│                    source in a first pass (RAW/FILL/DONT_CARE, no bytes
+│                    kept) so the sparse header's chunk count can be written
+│                    correctly up front, then re-streams it a second time to
+│                    actually emit the encoded output; used by "Edit & merge
+│                    partitions" (and the other build features) whenever
+│                    "output as Android sparse image" is checked
 ├── raw-image.js      Fallback for standalone raw partition images (no LP
 │                    header at all, e.g. a GSI system.img): detects the
 │                    ext4/EROFS filesystem directly and synthesizes a
@@ -517,37 +534,54 @@ that means the dynamic-partition table itself has to be recomputed
    through the same sparse-or-raw decoder as the main super.img.
 3. Clicking "Build modified super.img" does the following, entirely
    client-side:
-   - **Deleting** a partition removes it from the partition table; its old
-     extent space is **abandoned, never reused** — the same
-     "never free blocks" policy this project uses everywhere else.
-   - **Replacing** a partition keeps its name/attributes/group, but its old
-     extent(s) are abandoned exactly like a delete, and its *new* content is
-     allocated fresh space, sector-aligned, appended after the end of
-     everything the original image could reference.
-   - **Adding** a partition works the same way — new content, newly
-     allocated space, under whichever existing group you chose for it (new
-     groups can't be created by this feature).
-   - Every **untouched** partition's bytes and extents are left completely
-     alone — not just unmodified content, but literally the exact same
-     on-disk byte offsets as before.
+   - **Deleting or replacing** a partition frees its old extent(s) for
+     reuse — new/replacement content is allocated into that freed space
+     first (first-fit, oldest-offset-first, splitting a single partition's
+     content across multiple extents if one freed fragment isn't enough on
+     its own — completely normal for a dynamic partition; freed fragments
+     from *different* deleted/replaced partitions can both be reused for
+     the same replacement), and only appended as brand new space once the
+     freed pool is exhausted. This is what makes it possible to replace a
+     partition with a *different-sized* image without necessarily growing
+     the output at all — as long as something else freed up enough room in
+     the same build (see `src/partition-editor.js`'s module doc comment
+     for the full allocator design).
+   - **Adding** a partition works the same way — allocated from the same
+     reclaimed-space-then-append pool, under whichever existing group you
+     chose for it (new groups can't be created by this feature).
+   - Every byte **not** touched by an edit — including any leftover
+     unreclaimed fragment of freed space — keeps its exact original file
+     offset; nothing is ever shifted around.
    - LP **geometry is never touched** (`metadata_max_size`/
      `metadata_slot_count`/`logical_block_size` all stay byte-for-byte
      identical); only the per-slot metadata header+tables are regenerated
-     (via the new `lp-writer.js`, the write-side counterpart of `lp.js`),
-     written into every existing metadata slot (primary and backup alike).
+     (via `lp-writer.js`, the write-side counterpart of `lp.js`), written
+     into every existing metadata slot (primary and backup alike).
      **Groups are preserved as-is** (name/flags/`maximum_size`); if a
      group declares a nonzero `maximum_size` cap, the planner checks the
      new layout still fits under it and refuses to build (with the exact
      numbers) rather than silently exceeding it.
-4. Because space is only ever appended, never reclaimed, **the output can
-   be larger than the original** — exactly how much is shown live in the
-   edit summary before you even click Build (original size vs. projected
-   new size). This is intentional: a bigger output is clearly surfaced, not
-   silently produced, and the summary explains the flashing implication (a
-   real device's physical `super` partition is a fixed size, so a grown
+4. If reclaimed space isn't enough, **the output can still end up larger
+   than the original** — exactly how much (and how much was reclaimed vs.
+   freshly appended) is shown live in the edit summary before you even
+   click Build. This is intentional: a bigger output is clearly surfaced,
+   not silently produced, and the summary explains the flashing implication
+   (a real device's physical `super` partition is a fixed size, so a grown
    image may no longer fit back onto the same device, even though it's a
    perfectly valid, flashable-via-fastboot-to-a-big-enough-target image).
-5. The result is delivered through the same download-link flow as every
+5. Optionally, check **"Output as Android sparse image"** before building.
+   `fastboot flash super` (and the userspace fastbootd path most Android
+   10+ devices use for dynamic partitions) can reject a raw image outright
+   with `Invalid sparse file format at header magic`, even when its size is
+   otherwise correct — this produces a real multi-chunk Android sparse file
+   instead (`src/sparse-encode.js`, the write-side counterpart of
+   `sparse.js`'s decoder), which also tends to come out much smaller
+   whenever there's zero-padding or other repeated-pattern content to
+   compress away. It takes longer to build (the data is read through
+   twice — once to classify it, once to actually emit it — since the
+   sparse format's header has to declare its exact chunk count up front)
+   but produces byte-identical logical content either way.
+6. The result is delivered through the same download-link flow as every
    other build in this app (or streamed straight to a pre-chosen folder) —
    see "Saving" above. **The original `super.img` is never modified.**
 
@@ -560,6 +594,10 @@ that means the dynamic-partition table itself has to be recomputed
 - It never touches AVB/dm-verity/vbmeta, same caveat as every other
   build feature here — a partition whose content changed will need
   verification handled separately before the result can boot verified.
+- It can reclaim space *within the same build*, but can't repartition a
+  physical device — if your edits genuinely need more room than the
+  original image's total size, the output will grow, and only you can
+  decide whether that's acceptable for however you intend to use it.
 - It never flashes anything.
 
 ## Known limitations
