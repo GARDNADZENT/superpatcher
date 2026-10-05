@@ -73,12 +73,18 @@ images don't need to fit in RAM or ever touch a server.
   that relayout works and what it does and doesn't guarantee.
 - **Resilient to transient file-read hiccups on very large images.** Every
   raw byte read from a loaded File/Blob (`src/file-read-retry.js`) retries
-  with backoff on the specific browser `NotReadableError`
-  ("the requested file could not be read, typically due to permission
-  problems...") that can surface partway through a long (many-minutes)
-  multi-gigabyte read — commonly antivirus/indexing software briefly
-  touching the file — instead of failing the entire build. Logged in the UI
-  when it happens so a brief pause is visible rather than silent.
+  patiently (10 attempts, exponential backoff capped at 20s — up to ~2
+  minutes of cumulative patience per read) on the specific browser
+  `NotReadableError` ("the requested file could not be read, typically due
+  to permission problems...") that can surface partway through a long
+  (many-minutes) multi-gigabyte read — commonly antivirus real-time
+  scanning, a OneDrive/Dropbox "Files On-Demand" placeholder needing to
+  re-download, or the system sleeping mid-build — instead of failing the
+  entire build over what's usually a temporary condition. Each retry is
+  logged in the UI so a pause is explained rather than silent; if every
+  retry is exhausted, the error is replaced with a longer, actionable
+  explanation of likely causes and what to try (your queued edits/selection
+  are preserved, so you can just try the same build again).
 - **Security scan: find Device Administrator-capable & security-plugin-like
   APKs.** Reads directly from a selected partition's filesystem (ext4 or
   EROFS, auto-detected from the superblock — no extraction-to-disk required

@@ -14,6 +14,7 @@ import {
 } from './device-lock-removal.js';
 import { createSha256Stream, toHex } from './sha256.js';
 import { planPartitionEdits, streamEditedSuperImage, PartitionEditError } from './partition-editor.js';
+import { isLikelyTransientReadError, TRANSIENT_READ_FAILURE_ADVICE } from './file-read-retry.js';
 // Note: src/stream-download.js (an automatic, no-folder-picker streaming
 // download via a service worker) is kept in the repo and fully tested, but
 // deliberately NOT used here as a silent default anymore -- in practice it
@@ -50,6 +51,19 @@ function log(msg, cls) {
  * silently for a few seconds during a long multi-gigabyte operation. */
 function logReadRetry(attempt, err) {
   log(`  (transient file read hiccup, retry ${attempt}: ${err.message || err}) — retrying…`, 'warn');
+}
+
+/** If `err` is the "could not be read" transient-file-access failure (and
+ * every automatic retry has already been exhausted), logs the longer,
+ * actionable explanation/remedies instead of just the raw browser error
+ * text. Returns true if it did so. */
+function logTransientReadAdviceIfApplicable(err) {
+  if (!isLikelyTransientReadError(err)) return false;
+  log('This build failed because your browser could not read a loaded file, even after retrying for a while:', 'err');
+  for (const line of TRANSIENT_READ_FAILURE_ADVICE.split('\n')) {
+    if (line.trim()) log(line, 'warn');
+  }
+  return true;
 }
 
 function formatBytes(n) {
@@ -608,6 +622,8 @@ buildEditedBtn.addEventListener('click', async () => {
     if (err instanceof PartitionEditError) {
       editStatus.textContent = `Could not build: ${err.message}`;
       log(`Edit plan rejected: ${err.message}`, 'err');
+    } else if (logTransientReadAdviceIfApplicable(err)) {
+      editStatus.textContent = 'A file could not be read (see the log for likely causes and what to try) — your queued changes are still here, you can click Build again.';
     } else {
       editStatus.textContent = 'Failed to build modified image — see log.';
       log(`ERROR building modified image: ${err.message}`, 'err');
@@ -877,6 +893,8 @@ extractBtn.addEventListener('click', async () => {
       ui.setError(err.message);
       if (err.cancelled) {
         log(`  Cancelled while extracting "${name}".`, 'warn');
+      } else if (logTransientReadAdviceIfApplicable(err)) {
+        log(`  ✗ "${name}" failed — see the advice just logged above.`, 'err');
       } else {
         console.error(err);
         log(`  ✗ "${name}" failed: ${err.message}`, 'err');
@@ -1408,8 +1426,12 @@ removeBtn.addEventListener('click', async () => {
     log('Patched super.img build complete.', 'ok');
   } catch (err) {
     console.error(err);
-    removeStatus.textContent = 'Failed to build/save patched image — see log.';
-    log(`ERROR building patched image: ${err.message}`, 'err');
+    if (logTransientReadAdviceIfApplicable(err)) {
+      removeStatus.textContent = 'A file could not be read (see the log for likely causes and what to try) — click "Remove selected" again once addressed.';
+    } else {
+      removeStatus.textContent = 'Failed to build/save patched image — see log.';
+      log(`ERROR building patched image: ${err.message}`, 'err');
+    }
   } finally {
     removeBtn.disabled = false;
     scanBtn.disabled = false;
@@ -1592,6 +1614,9 @@ deviceLockBtn.addEventListener('click', async () => {
       deviceLockResult.textContent = `STOP — no changes were made.\n\n${err.message}${missingList ? `\n\nMissing target(s):\n${missingList}` : ''}`;
       deviceLockStatus.textContent = 'Stopped — see details below.';
       log(`STOP: ${err.message}`, 'err');
+    } else if (logTransientReadAdviceIfApplicable(err)) {
+      deviceLockResult.textContent = 'A file could not be read (see the log for likely causes and what to try). Try again once addressed.';
+      deviceLockStatus.textContent = 'Failed — see log.';
     } else {
       console.error(err);
       deviceLockResult.textContent = `ERROR: ${err.message}`;

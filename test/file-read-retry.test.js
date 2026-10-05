@@ -7,7 +7,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { readFileRangeWithRetry } from '../src/file-read-retry.js';
+import { readFileRangeWithRetry, isLikelyTransientReadError, TRANSIENT_READ_FAILURE_ADVICE } from '../src/file-read-retry.js';
 
 /** A fake Blob whose .slice(...).arrayBuffer() can be scripted to fail a
  * given number of times (with a configurable error) before succeeding. */
@@ -81,6 +81,43 @@ test('readFileRangeWithRetry(): does NOT retry a genuinely different error', asy
   const blob = makeFlakyBlob(bytes, { failTimes: 1, error: otherError });
   await assert.rejects(() => readFileRangeWithRetry(blob, 0, 3, { baseDelayMs: 1 }), /unrelated failure/);
   assert.equal(blob.callCount, 1, 'must not retry a non-transient error');
+});
+
+test('readFileRangeWithRetry(): backoff delay is capped by maxDelayMs', async () => {
+  const bytes = new Uint8Array([5]);
+  const blob = makeFlakyBlob(bytes, { failTimes: 4 });
+  const delays = [];
+  let last = Date.now();
+  const result = await readFileRangeWithRetry(blob, 0, 1, {
+    baseDelayMs: 50,
+    maxDelayMs: 60, // forces the exponential growth (50,100,200,400) to clamp down to 60 quickly
+    onRetry: () => {
+      const now = Date.now();
+      delays.push(now - last);
+      last = now;
+    },
+  });
+  assert.deepEqual(result, bytes);
+  // First gap ~50ms (unclamped), remaining gaps should all be clamped near
+  // maxDelayMs rather than continuing to double -- allow generous slack
+  // since timers aren't perfectly precise.
+  assert.ok(delays[delays.length - 1] < 200, `expected a clamped delay, got ${delays[delays.length - 1]}ms`);
+});
+
+test('isLikelyTransientReadError(): recognizes NotReadableError by name and by message text', () => {
+  assert.equal(isLikelyTransientReadError({ name: 'NotReadableError', message: 'whatever' }), true);
+  assert.equal(
+    isLikelyTransientReadError(new Error('The requested file could not be read, typically due to permission problems...')),
+    true
+  );
+  assert.equal(isLikelyTransientReadError(new Error('totally unrelated failure')), false);
+  assert.equal(isLikelyTransientReadError(null), false);
+});
+
+test('TRANSIENT_READ_FAILURE_ADVICE is a non-empty, user-actionable string', () => {
+  assert.equal(typeof TRANSIENT_READ_FAILURE_ADVICE, 'string');
+  assert.ok(TRANSIENT_READ_FAILURE_ADVICE.length > 50);
+  assert.match(TRANSIENT_READ_FAILURE_ADVICE, /antivirus/i);
 });
 
 test('readFileRangeWithRetry(): backoff delay grows between attempts', async () => {
