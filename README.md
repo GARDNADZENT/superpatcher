@@ -92,6 +92,24 @@ images don't need to fit in RAM or ever touch a server.
   fresh (right before building, not long before) is the real fix for a
   stale reference — plus the usual other suspects (cloud-sync placeholder
   files, antivirus, system sleep) worth ruling out too.
+- **Sets expectations for the browser's own slow "finalize" step when
+  saving a large file into a chosen folder.** When writing through the File
+  System Access API (`showDirectoryPicker()`), the browser stages every
+  write into a hidden `<name>.crswap` temp file and only does the real
+  work — scanning that whole temp file and atomically renaming it into
+  place — when you `close()` the stream. This is a documented, currently
+  unfixed browser behavior (not something this app's code controls) that
+  can take anywhere from under a minute to tens of minutes for
+  multi-gigabyte files, especially on slower drives or with antivirus
+  scanning the finished file. Rather than leaving you watching a
+  "finalizing…" message with zero feedback, this app warns up front when a
+  large file is about to be saved this way, and logs periodic "still
+  finalizing, this is normal" reassurance every 20 seconds while it's
+  happening, so a long wait doesn't look identical to a frozen tab. If you'd
+  rather avoid this step entirely, don't choose an output folder for very
+  large builds — the download-link path doesn't go through
+  `FileSystemWritableFileStream` at all (at the cost of needing enough free
+  memory to hold the whole file first).
 - **Security scan: find Device Administrator-capable & security-plugin-like
   APKs.** Reads directly from a selected partition's filesystem (ext4 or
   EROFS, auto-detected from the superblock — no extraction-to-disk required

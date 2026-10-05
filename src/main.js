@@ -71,6 +71,59 @@ function logTransientReadAdviceIfApplicable(err) {
   return true;
 }
 
+const LARGE_FOLDER_WRITE_WARNING_THRESHOLD = 2 * 1024 * 1024 * 1024; // 2 GiB
+
+/** Warns upfront, before writing even starts, when saving a large file into
+ * a chosen folder -- the File System Access API's close() step (which
+ * finalizes a ".crswap" temp file into the real filename) is a documented
+ * browser behavior that scans the whole temp file and can take anywhere
+ * from seconds to tens of minutes for multi-gigabyte files, with no
+ * current fix on the browser side (confirmed: this is not something this
+ * tool's code controls). Telling the user this BEFORE they spend 20
+ * minutes watching "finalizing…" wondering if it's frozen is far better
+ * than them finding out the hard way. */
+function warnIfLargeFolderWrite(totalBytes) {
+  if (state.dirHandle && totalBytes >= LARGE_FOLDER_WRITE_WARNING_THRESHOLD) {
+    log(
+      `Heads up: saving a ${formatBytes(totalBytes)} file directly into a chosen folder has a known slow final ` +
+        `step in the browser itself (not this tool) -- after all bytes are written, the browser scans the whole ` +
+        `file before renaming it into place, which can take anywhere from under a minute to tens of minutes for ` +
+        `files this large, especially on slower drives or with antivirus scanning it. The "finalizing…" step ` +
+        `below may look stuck but is very likely still working -- please leave this tab open and wait it out. ` +
+        `If you'd rather avoid this entirely, don't choose an output folder for very large builds; the resulting ` +
+        'download-link path does not have this slow step (at the cost of needing enough free memory to hold the ' +
+        'whole file).',
+      'warn'
+    );
+  }
+}
+
+/** Wraps sink.close() with periodic "still working" reassurance for a
+ * potentially very long File System Access API finalize step (see
+ * warnIfLargeFolderWrite) -- otherwise a 20-minute close() looks identical
+ * to a frozen tab, with zero feedback the whole time. */
+async function closeSinkWithFeedback(sink, label) {
+  let done = false;
+  const started = Date.now();
+  const interval = state.dirHandle
+    ? setInterval(() => {
+        if (!done) {
+          log(
+            `  still finalizing "${label}"… (${Math.round((Date.now() - started) / 1000)}s so far -- this is the ` +
+              `browser's own slow step for large files saved to a folder, not a hang; keep waiting)`,
+            'warn'
+          );
+        }
+      }, 20_000)
+    : null;
+  try {
+    await sink.close();
+  } finally {
+    done = true;
+    if (interval) clearInterval(interval);
+  }
+}
+
 function formatBytes(n) {
   const num = typeof n === 'bigint' ? Number(n) : n;
   if (!Number.isFinite(num)) return String(n);
@@ -209,13 +262,18 @@ parseBtn.addEventListener('click', async () => {
       );
       renderMeta();
       initBrowseCard(built.meta);
-      initEditCard(built.meta);
 
       $('metaCard').classList.remove('hidden');
       $('extractCard').classList.remove('hidden');
       $('scanCard').classList.remove('hidden');
       $('removeCard').classList.add('hidden');
-      $('deviceLockCard').classList.add('hidden'); // fixed-path targets never apply to a single raw partition
+      // A standalone raw image has no real LP metadata region at all (it's
+      // just one filesystem starting at byte 0) -- there's no partition
+      // table to edit/merge, and the three fixed device-lock-removal
+      // target paths assume a real multi-partition dynamic image, so both
+      // features are hidden rather than shown and failing confusingly.
+      $('editCard').classList.add('hidden');
+      $('deviceLockCard').classList.add('hidden');
       parseStatus.textContent = 'Done (loaded as a single raw partition image).';
       return;
     }
@@ -599,6 +657,7 @@ buildEditedBtn.addEventListener('click', async () => {
         ? `Streaming super_MODIFIED.img straight into the chosen folder "${state.dirHandle.name}"…`
         : "Building super_MODIFIED.img in memory — a download link will appear below when it's ready…"
     );
+    warnIfLargeFolderWrite(plan.newTotalSize);
     const ui = addProgressRow('super_MODIFIED.img', editProgress);
     const sink = await makeSink('super_MODIFIED.img', plan.newTotalSize, editDownloads);
     let written = 0;
@@ -615,7 +674,7 @@ buildEditedBtn.addEventListener('click', async () => {
       }
     }
     log(`  super_MODIFIED.img: 100% (${formatBytes(written)}) — finalizing…`);
-    await sink.close();
+    await closeSinkWithFeedback(sink, 'super_MODIFIED.img');
     ui.setDone();
 
     editStatus.textContent = state.dirHandle
@@ -874,8 +933,11 @@ extractBtn.addEventListener('click', async () => {
     const ui = addProgressRow(`${name}.img`);
     const totalBytes = partitionSizeBytes(meta, partition);
     log(`Extracting "${name}" (${formatBytes(totalBytes)})…`);
+    warnIfLargeFolderWrite(Number(totalBytes));
     try {
       const sink = await makeSink(`${name}.img`, Number(totalBytes), ui.extraEl);
+      const rawClose = sink.close.bind(sink);
+      sink.close = () => closeSinkWithFeedback({ close: rawClose }, `${name}.img`);
       let lastLoggedPct = -1;
       await extractPartition(disk, meta, partition, sink, {
         onProgress: (written, total) => {
@@ -1402,6 +1464,7 @@ removeBtn.addEventListener('click', async () => {
         ? `Streaming super_patched.img straight into the chosen folder "${state.dirHandle.name}"…`
         : 'Building super_patched.img in memory — a download link will appear below when it\'s ready…'
     );
+    warnIfLargeFolderWrite(state.disk.totalSize);
     const ui = addProgressRow('super_patched.img', removeProgress);
     const sink = await makeSink('super_patched.img', state.disk.totalSize, ui.extraEl);
     const { disk, patchSet } = state;
@@ -1419,7 +1482,7 @@ removeBtn.addEventListener('click', async () => {
       }
     }
     log(`  super_patched.img: 100% (${formatBytes(written)}) — finalizing…`);
-    await sink.close();
+    await closeSinkWithFeedback(sink, 'super_patched.img');
     ui.setDone();
     removeStatus.textContent = state.dirHandle
       ? `Done. Saved super_patched.img (${formatBytes(disk.totalSize)}) to "${state.dirHandle.name}". ` +
@@ -1512,6 +1575,7 @@ deviceLockBtn.addEventListener('click', async () => {
         ? `  streaming straight into the chosen folder "${state.dirHandle.name}"…`
         : "  building in memory — a download link will appear below when it's ready…"
     );
+    warnIfLargeFolderWrite(disk.totalSize);
     const hasher = createSha256Stream();
     const sink = await makeSink('super_MODIFIED.img', disk.totalSize, deviceLockDownloads);
     let written = 0;
@@ -1528,7 +1592,7 @@ deviceLockBtn.addEventListener('click', async () => {
       }
     }
     log(`  super_MODIFIED.img: 100% (${formatBytes(written)}) — finalizing…`);
-    await sink.close();
+    await closeSinkWithFeedback(sink, 'super_MODIFIED.img');
     const modifiedSha256 = toHex(hasher.digest());
     log(`  modified SHA-256: ${modifiedSha256}`, 'ok');
 
