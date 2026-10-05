@@ -178,6 +178,7 @@ parseBtn.addEventListener('click', async () => {
         'ok'
       );
       renderMeta();
+      initBrowseCard(built.meta);
 
       $('metaCard').classList.remove('hidden');
       $('extractCard').classList.remove('hidden');
@@ -199,6 +200,7 @@ parseBtn.addEventListener('click', async () => {
     state.lastScanReport = null;
 
     await loadSlot(0);
+    initBrowseCard(state.meta);
 
     $('metaCard').classList.remove('hidden');
     $('extractCard').classList.remove('hidden');
@@ -582,7 +584,194 @@ cancelBtn.addEventListener('click', () => {
   $('extractStatus').textContent = 'Cancelling…';
 });
 
-// ---------- 4. security scan (read-only: finds Device Administrator APKs) ----------
+// ---------- 4. browse files ----------
+const browseCard = $('browseCard');
+const browsePartitionSelect = $('browsePartitionSelect');
+const browseStatus = $('browseStatus');
+const browseBreadcrumb = $('browseBreadcrumb');
+const browseTable = $('browseTable');
+const browseWarning = $('browseWarning');
+const browseDownloads = $('browseDownloads');
+
+// Per currently-open partition: the live volume + the navigation stack
+// (root -> ... -> current directory), each entry {name, inode}.
+let browseVolume = null;
+let browseFsType = null;
+let browsePath = []; // [{name, inode}], index 0 is always the root
+
+function entryInodeId(entry) {
+  return entry.inodeNumber ?? entry.nid;
+}
+
+function fileTypeLabel(inode) {
+  if (inode.isDir) return 'folder';
+  if (inode.isSymlink) return 'symlink';
+  if (inode.isRegular) return 'file';
+  return 'other';
+}
+
+function fileTypeIcon(inode) {
+  if (inode.isDir) return '📁';
+  if (inode.isSymlink) return '🔗';
+  return '📄';
+}
+
+function initBrowseCard(meta) {
+  browseCard.classList.remove('hidden');
+  browsePartitionSelect.innerHTML = '';
+  for (const p of meta.partitions) {
+    const opt = document.createElement('option');
+    opt.value = p.name;
+    opt.textContent = p.name;
+    browsePartitionSelect.appendChild(opt);
+  }
+  if (meta.partitions.length) openBrowsePartition(meta.partitions[0].name);
+}
+
+async function openBrowsePartition(name) {
+  const { disk, meta } = state;
+  const partition = meta.partitions.find((p) => p.name === name);
+  if (!partition) return;
+
+  browseVolume = null;
+  browseFsType = null;
+  browsePath = [];
+  browseWarning.textContent = '';
+  browseTable.innerHTML = '';
+  browseDownloads.innerHTML = '';
+  browseStatus.textContent = `Opening "${name}"…`;
+
+  try {
+    const readRange = makePartitionReader(disk, meta, partition);
+    const { type, volume } = await detectAndOpenFilesystem(readRange);
+    browseVolume = volume;
+    browseFsType = type;
+    browsePath = [{ name: '/', inode: volume.rootInode }];
+    browseStatus.textContent = `"${name}" (${type})`;
+    renderBrowseDir();
+  } catch (err) {
+    browseStatus.textContent = `Could not open "${name}": ${err.message}`;
+    log(`Browse: could not open "${name}": ${err.message}`, 'warn');
+  }
+}
+
+browsePartitionSelect.addEventListener('change', () => openBrowsePartition(browsePartitionSelect.value));
+
+function renderBreadcrumb() {
+  browseBreadcrumb.innerHTML = '';
+  browsePath.forEach((seg, idx) => {
+    if (idx > 0) browseBreadcrumb.appendChild(document.createTextNode(' / '));
+    const a = document.createElement('a');
+    a.href = '#';
+    a.textContent = seg.name === '/' ? '/' : seg.name;
+    a.style.color = idx === browsePath.length - 1 ? 'var(--text)' : 'var(--accent)';
+    a.addEventListener('click', (e) => {
+      e.preventDefault();
+      browsePath = browsePath.slice(0, idx + 1);
+      renderBrowseDir();
+    });
+    browseBreadcrumb.appendChild(a);
+  });
+}
+
+async function downloadBrowsedFile(childInode, name) {
+  log(`Reading "${name}" (${formatBytes(childInode.size)})…`);
+  try {
+    const bytes = await browseVolume.readFile(childInode);
+    const blob = new Blob([bytes]);
+    renderDownloadReady(browseDownloads, name, blob);
+    log(`"${name}" is ready (${formatBytes(blob.size)}) — click the download link below.`, 'ok');
+  } catch (err) {
+    console.error(err);
+    log(`Could not read "${name}": ${err.message}`, 'err');
+  }
+}
+
+async function renderBrowseDir() {
+  renderBreadcrumb();
+  browseTable.innerHTML = '';
+  browseWarning.textContent = '';
+  const dirInode = browsePath[browsePath.length - 1].inode;
+
+  let entries;
+  try {
+    entries = await browseVolume.listDir(dirInode);
+  } catch (err) {
+    browseWarning.textContent = `Could not list this directory: ${err.message}`;
+    return;
+  }
+  entries.sort((a, b) => a.name.localeCompare(b.name));
+
+  if (browsePath.length > 1) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>⬆️</td><td class="name"><a href="#">..</a></td><td class="attrs">folder</td><td>—</td><td></td>`;
+    tr.querySelector('a').addEventListener('click', (e) => {
+      e.preventDefault();
+      browsePath = browsePath.slice(0, -1);
+      renderBrowseDir();
+    });
+    browseTable.appendChild(tr);
+  }
+
+  for (const entry of entries) {
+    let childInode;
+    try {
+      childInode = await browseVolume.readInode(entryInodeId(entry));
+    } catch (err) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>⚠️</td><td class="name">${escapeHtml(entry.name)}</td><td class="attrs" colspan="3">could not read inode: ${escapeHtml(err.message)}</td>`;
+      browseTable.appendChild(tr);
+      continue;
+    }
+
+    const tr = document.createElement('tr');
+    const sizeText = childInode.isDir ? '—' : formatBytes(childInode.size ?? 0);
+    const nameCell = document.createElement('td');
+    nameCell.className = 'name';
+    if (childInode.isDir) {
+      const a = document.createElement('a');
+      a.href = '#';
+      a.textContent = entry.name;
+      a.addEventListener('click', (e) => {
+        e.preventDefault();
+        browsePath = [...browsePath, { name: entry.name, inode: childInode }];
+        renderBrowseDir();
+      });
+      nameCell.appendChild(a);
+    } else {
+      nameCell.textContent = entry.name;
+    }
+
+    tr.innerHTML = `<td>${fileTypeIcon(childInode)}</td>`;
+    tr.appendChild(nameCell);
+    const typeTd = document.createElement('td');
+    typeTd.className = 'attrs';
+    typeTd.textContent = fileTypeLabel(childInode);
+    tr.appendChild(typeTd);
+    const sizeTd = document.createElement('td');
+    sizeTd.className = 'size';
+    sizeTd.textContent = sizeText;
+    tr.appendChild(sizeTd);
+    const actionTd = document.createElement('td');
+    if (childInode.isRegular) {
+      const btn = document.createElement('button');
+      btn.className = 'secondary';
+      btn.textContent = 'Download';
+      btn.addEventListener('click', () => downloadBrowsedFile(childInode, entry.name));
+      actionTd.appendChild(btn);
+    }
+    tr.appendChild(actionTd);
+    browseTable.appendChild(tr);
+  }
+
+  if (!entries.length) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td colspan="5" class="muted">Empty directory.</td>`;
+    browseTable.appendChild(tr);
+  }
+}
+
+// ---------- 5. security scan (read-only: finds Device Administrator APKs) ----------
 const scanBtn = $('scanBtn');
 const scanStatus = $('scanStatus');
 const scanResults = $('scanResults');
@@ -816,7 +1005,7 @@ scanBtn.addEventListener('click', async () => {
   }
 });
 
-// ---------- 5. remove flagged apps & build a patched super.img ----------
+// ---------- 6. remove flagged apps & build a patched super.img ----------
 const removeBtn = $('removeBtn');
 const removeStatus = $('removeStatus');
 const removeProgress = $('removeProgress');
@@ -899,10 +1088,10 @@ removeBtn.addEventListener('click', async () => {
     ui.setDone();
     removeStatus.textContent = state.dirHandle
       ? `Done. Saved super_patched.img (${formatBytes(disk.totalSize)}) to "${state.dirHandle.name}". ` +
-        `Flash it with fastboot (e.g. "fastboot flash super super_patched.img") — see the warnings above section 5 ` +
+        `Flash it with fastboot (e.g. "fastboot flash super super_patched.img") — see the warnings above section 6 ` +
         `about AVB/dm-verity before you do.`
       : `Done. super_patched.img (${formatBytes(disk.totalSize)}) is ready — click the download link below. ` +
-        `Flash it with fastboot (e.g. "fastboot flash super super_patched.img") — see the warnings above section 5 ` +
+        `Flash it with fastboot (e.g. "fastboot flash super super_patched.img") — see the warnings above section 6 ` +
         `about AVB/dm-verity before you do.`;
     log('Patched super.img build complete.', 'ok');
   } catch (err) {
@@ -915,7 +1104,7 @@ removeBtn.addEventListener('click', async () => {
   }
 });
 
-// ---------- 6. Remove Device Lock Components (fixed, hardcoded targets) ----------
+// ---------- 7. Remove Device Lock Components (fixed, hardcoded targets) ----------
 const deviceLockBtn = $('deviceLockBtn');
 const deviceLockStatus = $('deviceLockStatus');
 const deviceLockResult = $('deviceLockResult');

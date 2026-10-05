@@ -316,13 +316,36 @@
       <div id="progressList" style="margin-top:16px;"></div>
     </section>
 
+    <section class="card hidden" id="browseCard">
+      <h2>4. Browse files</h2>
+      <p class="muted" style="margin-top:-6px;">
+        Open a partition's filesystem (ext4 or EROFS, auto-detected) and navigate its directory tree directly —
+        see exactly what's inside without extracting the whole partition first, and download individual files
+        (an APK, a config file, anything) on their own.
+      </p>
+      <div class="row">
+        <label class="muted" for="browsePartitionSelect">Partition:</label>
+        <select id="browsePartitionSelect"></select>
+        <span class="muted" id="browseStatus"></span>
+      </div>
+      <div id="browseBreadcrumb" class="mono" style="margin-top:12px; font-size:12.5px;"></div>
+      <table style="margin-top:8px;">
+        <thead>
+          <tr><th style="width:24px;"></th><th>Name</th><th>Type</th><th>Size</th><th style="width:90px;"></th></tr>
+        </thead>
+        <tbody id="browseTable"></tbody>
+      </table>
+      <div id="browseWarning" class="scan-warning"></div>
+      <div id="browseDownloads"></div>
+    </section>
+
     <section class="card hidden" id="scanCard">
-      <h2>4. Security scan — find Device Administrator &amp; security-plugin APKs</h2>
+      <h2>5. Security scan — find Device Administrator &amp; security-plugin APKs</h2>
       <p class="muted" style="margin-top:-6px;">
         Scans the selected partitions' <strong>file systems directly</strong> (ext4 or EROFS, auto-detected) for
         <code>.apk</code> files, checks each app's manifest for Device Administrator capability, and flags names
         that look like security/MDM plugins (a separate, looser heuristic). The scan itself never modifies
-        anything; removal (section 5 below) is a distinct, explicit step.
+        anything; removal (section 6 below) is a distinct, explicit step.
       </p>
       <div class="row">
         <button id="scanBtn">Scan selected partitions</button>
@@ -344,7 +367,7 @@
     </section>
 
     <section class="card hidden" id="removeCard">
-      <h2>5. Remove flagged apps &amp; build a patched super.img</h2>
+      <h2>6. Remove flagged apps &amp; build a patched super.img</h2>
       <div class="callout">
         <strong>Read before using this.</strong> This tool can delete the selected apps' files from the loaded
         partition images and produce a new, patched <code>super.img</code> you can flash with
@@ -374,7 +397,7 @@
     </section>
 
     <section class="card hidden" id="deviceLockCard">
-      <h2>6. Remove Device Lock Components <span class="badge warn">fixed targets</span></h2>
+      <h2>7. Remove Device Lock Components <span class="badge warn">fixed targets</span></h2>
       <div class="callout">
         <strong>What this does.</strong> This action removes exactly three hardcoded files, by their exact path —
         regardless of what the scan above reports (the scanner can't read some compressed EROFS APKs' contents,

@@ -57,6 +57,11 @@ images don't need to fit in RAM or ever touch a server.
   hashing, per-target verification, per-chunk build progress, each
   validation check, and report writing all get their own log line — and
   cancellation.
+- **Browse files**: open any partition's filesystem (ext4 or EROFS,
+  auto-detected) and navigate its directory tree directly in the browser —
+  breadcrumbs, folder-by-folder navigation, file type/size per entry — and
+  download any individual file on its own, without having to extract the
+  whole partition first just to see what's inside it or pull out one file.
 - **Security scan: find Device Administrator-capable & security-plugin-like
   APKs.** Reads directly from a selected partition's filesystem (ext4 or
   EROFS, auto-detected from the superblock — no extraction-to-disk required
